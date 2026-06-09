@@ -26,9 +26,9 @@ class SafeLidarMotion(Node):
         self.lidar_offset_deg = 180  
 
         # Safety distances
-        self.emergency_front_distance = 1.0
-        self.slow_front_distance      = 2
-        self.side_safe_distance       = 1.32
+        self.emergency_front_distance = 0.5
+        self.slow_front_distance      = 1
+        self.side_safe_distance       = 0.8
 
         # Speeds
         self.normal_forward_speed = 0.10

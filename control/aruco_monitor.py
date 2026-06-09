@@ -60,3 +60,17 @@ class ArucoMonitor(Node):
     def seen_markers(self) -> Set[int]:
         """Public API for other nodes to query discovered markers."""
         return self._seen_markers.copy()
+    def print_summary(self) -> None:
+        if not self._seen_markers:
+            self.get_logger().info("No ArUco markers were detected during this run.")
+            return
+
+        self.get_logger().info(
+            f"\n"
+            f"╔══════════════════════════════════╗\n"
+            f"║       ARUCO MARKERS FOUND        ║\n"
+            f"╠══════════════════════════════════╣\n"
+            f"║  Total: {len(self._seen_markers):<26}║\n"
+            f"║  IDs:   {str(sorted(self._seen_markers)):<26}║\n"
+            f"╚══════════════════════════════════╝"
+        )

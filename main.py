@@ -67,13 +67,15 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
+        # Print ArUco summary before shutting down
+        monitor.print_summary()
+
         from geometry_msgs.msg import Twist
         stop = Twist()
         motion.cmd_pub.publish(stop)
         for node in [motion, monitor, camera, lidar]:
             node.destroy_node()
         rclpy.shutdown()
-
 
 if __name__ == '__main__':
     main()
