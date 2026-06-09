@@ -1,484 +1,841 @@
-from typing import Callable, Iterable, Optional, Tuple
+#!/usr/bin/env python3
 
+import math
 import numpy as np
-import numpy.typing as npt
-import warnings
 
-from helpers import (
-    DEFAULT_MAX_MARKERS,
-    LM_DIM,
-    ROBOT_DIM,
-    lm_slice,
-    pose2d_to_Twb,
-    wrap_to_pi,
-)
+import rclpy
+from rclpy.node import Node
 
-ArrayF = npt.NDArray[np.float64]
-ArrayB = npt.NDArray[np.bool_]
-
-MotionModelCallback = Callable[
-    [ArrayF, float, float, float, float, bool],
-    Tuple[ArrayF, ArrayF]
-]
-
-# (marker_id, T_cm)
-Detection = Tuple[int, ArrayF]
+from sensor_msgs.msg import LaserScan
+from nav_msgs.msg import Odometry, OccupancyGrid
+from geometry_msgs.msg import PoseWithCovarianceStamped
+from visualization_msgs.msg import Marker, MarkerArray
 
 
-class EKFSLAM:
+def normalize_angle(angle):
+    return math.atan2(math.sin(angle), math.cos(angle))
+
+
+def stamp_to_sec(stamp):
+    return stamp.sec + stamp.nanosec * 1e-9
+
+
+class EKFLidarSLAM(Node):
     """
-    EKF-SLAM for omnidirectional robot + planar landmarks.
+    EKF-SLAM από την αρχή με LiDAR landmarks.
 
-    Robot state:
-        [x, y, theta]
+    State:
+        mu = [x, y, theta, m1x, m1y, m2x, m2y, ...]^T
 
-    Landmark state:
-        [mx, my]
+    Prediction:
+        από /odom, με vx, vy, wz
 
-    Full state:
-        [robot_state, landmark_0, landmark_1, ...]
+    Correction:
+        από LiDAR landmarks:
+            - jump points / depth discontinuities
+            - local corner-like points
 
-    Measurements:
-        z = [range, bearing]
+    Mapping:
+        occupancy grid από τα LiDAR rays
     """
 
-    MIN_RANGE = 1e-6
+    def __init__(self):
+        super().__init__('ekf_lidar_slam')
 
-    def __init__(
-        self,
-        max_markers: int = DEFAULT_MAX_MARKERS,
-        T_bc: Optional[npt.ArrayLike] = None,
-        mu: Optional[npt.ArrayLike] = None,
-        Sigma: Optional[npt.ArrayLike] = None,
-        marker_seen: Optional[npt.ArrayLike] = None,
-        R: Optional[npt.ArrayLike] = None,
-        Q: Optional[npt.ArrayLike] = None,
-        motion_model_callback: Optional[MotionModelCallback] = None,
-    ) -> None:
+        # --------------------------------------------------
+        # Topics
+        # --------------------------------------------------
+        self.scan_topic = '/scan'
+        self.odom_topic = '/odom'
 
-        self.max_markers = int(max_markers)
+        self.pose_topic = '/slam_pose'
+        self.map_topic = '/slam_map'
+        self.landmark_topic = '/slam_landmarks'
 
-        self.state_dim = (
-            ROBOT_DIM
-            + self.max_markers * LM_DIM
+        self.create_subscription(LaserScan, self.scan_topic, self.scan_callback, 10)
+        self.create_subscription(Odometry, self.odom_topic, self.odom_callback, 30)
+
+        self.pose_pub = self.create_publisher(
+            PoseWithCovarianceStamped,
+            self.pose_topic,
+            10
         )
 
-        # camera pose wrt robot base
-        self.T_bc = (
-            np.eye(4)
-            if T_bc is None
-            else np.array(T_bc, dtype=float).reshape(4, 4)
+        self.map_pub = self.create_publisher(
+            OccupancyGrid,
+            self.map_topic,
+            1
         )
 
-        # state mean
-        self._mu = (
-            np.zeros(self.state_dim, dtype=float)
-            if mu is None
-            else np.array(mu, dtype=float).reshape(self.state_dim)
+        self.landmark_pub = self.create_publisher(
+            MarkerArray,
+            self.landmark_topic,
+            1
         )
 
-        self._mu[2] = wrap_to_pi(self._mu[2])
+        # --------------------------------------------------
+        # EKF state
+        # --------------------------------------------------
+        self.mu = np.zeros((3, 1))  # [x, y, theta]
+        self.Sigma = np.diag([0.02, 0.02, np.deg2rad(2.0)]) ** 2
 
-        # covariance
-        if Sigma is None:
+        self.num_landmarks = 0
 
-            Sigma = np.eye(
-                self.state_dim,
-                dtype=float,
-            ) * 1e-3
+        # Motion noise R_t
+        self.motion_noise = np.diag([
+            0.03,               # x noise
+            0.03,               # y noise
+            np.deg2rad(2.0)     # theta noise
+        ]) ** 2
 
-            # unknown landmarks
-            Sigma[ROBOT_DIM:, ROBOT_DIM:] = (
-                np.eye(
-                    self.state_dim - ROBOT_DIM,
-                    dtype=float,
-                ) * 1e6
-            )
+        # Observation noise Q_t for z = [range, bearing]
+        self.obs_noise = np.diag([
+            0.10,               # range noise in meters
+            np.deg2rad(5.0)     # bearing noise
+        ]) ** 2
 
-        self._Sigma = np.array(
-            Sigma,
-            dtype=float,
-        ).reshape(self.state_dim, self.state_dim)
+        # --------------------------------------------------
+        # Data association
+        # --------------------------------------------------
+        self.mahalanobis_threshold = 5.99
+        # 5.99 περίπου 95% confidence για 2D measurement
 
-        # landmark observation flags
-        self._marker_seen = (
-            np.zeros(self.max_markers, dtype=bool)
-            if marker_seen is None
-            else np.array(
-                marker_seen,
-                dtype=bool,
-            ).reshape(self.max_markers)
-        )
+        self.new_landmark_min_distance = 0.30
+        self.max_landmark_range = 3.50
+        self.min_landmark_range = 0.25
 
-        # process noise
-        self._R = (
-            np.diag([
-                0.03**2,
-                0.03**2,
-                np.deg2rad(2.0)**2,
-            ])
-            if R is None
-            else np.array(R, dtype=float).reshape(3, 3)
-        )
+        # Δεν προσθέτουμε αμέσως κάθε feature ως landmark.
+        # Πρώτα το κρατάμε σαν candidate.
+        self.candidate_landmarks = []
+        self.candidate_match_distance = 0.35
+        self.candidate_required_seen = 2
 
-        # measurement noise
-        self._Q = (
-            np.diag([
-                0.05**2,
-                np.deg2rad(3.0)**2,
-            ])
-            if Q is None
-            else np.array(Q, dtype=float).reshape(2, 2)
-        )
+        # --------------------------------------------------
+        # LiDAR feature extraction parameters
+        # --------------------------------------------------
+        self.jump_threshold = 0.35
+        self.min_jump_range = 0.25
+        self.max_jump_range = 3.50
 
-        if motion_model_callback is None:
+        self.corner_angle_min_deg = 40.0
+        self.corner_angle_max_deg = 140.0
+        self.corner_stride = 4
+        self.corner_min_range = 0.30
+        self.corner_max_range = 3.00
 
-            raise ValueError(
-                "motion_model_callback is required."
-            )
+        self.min_feature_separation = 0.25
 
-        self._motion_model_callback = motion_model_callback
+        # --------------------------------------------------
+        # Occupancy grid
+        # --------------------------------------------------
+        self.map_resolution = 0.05      # 5 cm / cell
+        self.map_size_m = 12.0          # 12m x 12m
+        self.map_width = int(self.map_size_m / self.map_resolution)
+        self.map_height = int(self.map_size_m / self.map_resolution)
 
-    @property
-    def mu(self) -> ArrayF:
-        return self._mu.copy()
+        self.map_origin_x = -self.map_size_m / 2.0
+        self.map_origin_y = -self.map_size_m / 2.0
 
-    @property
-    def Sigma(self) -> ArrayF:
-        return self._Sigma.copy()
+        self.log_odds = np.zeros((self.map_height, self.map_width), dtype=np.float32)
+        self.known = np.zeros((self.map_height, self.map_width), dtype=bool)
 
-    @property
-    def marker_seen(self) -> ArrayB:
-        return self._marker_seen.copy()
+        self.log_free = -0.35
+        self.log_occ = 0.85
+        self.log_min = -5.0
+        self.log_max = 5.0
 
-    def landmark_slice(
-        self,
-        marker_index: int,
-    ) -> slice:
+        self.max_mapping_range = 4.0
 
-        return lm_slice(
-            marker_index,
-            robot_dim=ROBOT_DIM,
-        )
+        # --------------------------------------------------
+        # Time
+        # --------------------------------------------------
+        self.prev_odom_time = None
 
-    @staticmethod
-    def measurement_body_from_T_cm(
-        T_bc: npt.ArrayLike,
-        T_cm_meas: npt.ArrayLike,
-    ) -> ArrayF:
+        self.get_logger().info('EKF LiDAR SLAM started.')
+        self.get_logger().info(f'Subscribing: {self.odom_topic}, {self.scan_topic}')
+        self.get_logger().info(f'Publishing: {self.pose_topic}, {self.map_topic}, {self.landmark_topic}')
+
+    # ======================================================
+    # Prediction step
+    # ======================================================
+
+    def odom_callback(self, msg: Odometry):
+        current_time = stamp_to_sec(msg.header.stamp)
+
+        if self.prev_odom_time is None:
+            self.prev_odom_time = current_time
+            return
+
+        dt = current_time - self.prev_odom_time
+        self.prev_odom_time = current_time
+
+        if dt <= 0.0 or dt > 1.0:
+            return
+
+        vx = msg.twist.twist.linear.x
+        vy = msg.twist.twist.linear.y
+        wz = msg.twist.twist.angular.z
+
+        self.predict(vx, vy, wz, dt)
+        self.publish_pose()
+
+    def predict(self, vx, vy, wz, dt):
         """
-        Converts camera transform -> body range/bearing.
-        """
+        Prediction:
+            x_new = x + (vx cosθ - vy sinθ) dt
+            y_new = y + (vx sinθ + vy cosθ) dt
+            θ_new = θ + wz dt
 
-        pb = (
-            T_bc
-            @ T_cm_meas
-            @ np.array([0.0, 0.0, 0.0, 1.0])
-        )
-
-        px = float(pb[0])
-        py = float(pb[1])
-
-        r = np.hypot(px, py)
-
-        phi = np.arctan2(py, px)
-
-        return np.array([r, phi])
-
-    def predicted_range_bearing(
-        self,
-        mu: npt.ArrayLike,
-        marker_index: int,
-    ) -> ArrayF:
-        """
-        Predicted measurement h(mu).
+        Τα landmarks δεν αλλάζουν στο prediction.
         """
 
-        mu = np.array(mu).reshape(self.state_dim)
+        x = self.mu[0, 0]
+        y = self.mu[1, 0]
+        theta = self.mu[2, 0]
 
-        x_r = mu[0]
-        y_r = mu[1]
-        theta_r = mu[2]
+        dx = (vx * math.cos(theta) - vy * math.sin(theta)) * dt
+        dy = (vx * math.sin(theta) + vy * math.cos(theta)) * dt
+        dtheta = wz * dt
 
-        sl = self.landmark_slice(marker_index)
+        self.mu[0, 0] = x + dx
+        self.mu[1, 0] = y + dy
+        self.mu[2, 0] = normalize_angle(theta + dtheta)
 
-        mx = mu[sl.start]
-        my = mu[sl.start + 1]
+        n = self.mu.shape[0]
+        F = np.eye(n)
 
-        dx = mx - x_r
-        dy = my - y_r
+        # Jacobian ως προς θ
+        F[0, 2] = (-vx * math.sin(theta) - vy * math.cos(theta)) * dt
+        F[1, 2] = ( vx * math.cos(theta) - vy * math.sin(theta)) * dt
 
-        r = np.hypot(dx, dy)
+        R_big = np.zeros((n, n))
+        R_big[0:3, 0:3] = self.motion_noise
 
-        phi = np.arctan2(dy, dx) - theta_r
+        self.Sigma = F @ self.Sigma @ F.T + R_big
 
-        phi = wrap_to_pi(phi)
+    # ======================================================
+    # LiDAR scan callback
+    # ======================================================
 
-        return np.array([r, phi])
+    def scan_callback(self, msg: LaserScan):
+        points, ranges, angles = self.scan_to_points(msg)
 
-    def measurement_residual(
-        self,
-        mu: npt.ArrayLike,
-        marker_index: int,
-        T_cm_meas: npt.ArrayLike,
-    ) -> ArrayF:
+        if len(points) < 10:
+            return
+
+        observations = self.extract_lidar_landmarks(points, ranges, angles)
+
+        for obs in observations:
+            self.process_observation(obs)
+
+        self.update_occupancy_grid(msg)
+        self.publish_pose()
+        self.publish_landmarks()
+        self.publish_map()
+
+    # ======================================================
+    # LiDAR preprocessing
+    # ======================================================
+
+    def scan_to_points(self, scan: LaserScan):
+        points = []
+        ranges = []
+        angles = []
+
+        for i, r in enumerate(scan.ranges):
+            if math.isnan(r) or math.isinf(r):
+                continue
+
+            if r < scan.range_min or r > scan.range_max:
+                continue
+
+            angle = scan.angle_min + i * scan.angle_increment
+
+            x = r * math.cos(angle)
+            y = r * math.sin(angle)
+
+            points.append([x, y])
+            ranges.append(r)
+            angles.append(angle)
+
+        return np.array(points), np.array(ranges), np.array(angles)
+
+    # ======================================================
+    # Landmark extraction from LiDAR
+    # ======================================================
+
+    def extract_lidar_landmarks(self, points, ranges, angles):
         """
-        Innovation:
-            y = z - h(mu)
+        Εξάγει candidate landmarks από LiDAR.
+
+        Χρησιμοποιεί:
+            1. jump points:
+                απότομη αλλαγή απόστασης |r_i - r_{i-1}|
+
+            2. local corner-like points:
+                τοπική αλλαγή κατεύθυνσης στο point cloud
+
+        Επιστρέφει λίστα από observations:
+            obs = {
+                "range": r,
+                "bearing": phi,
+                "type": "jump" ή "corner"
+            }
         """
 
-        z = self.measurement_body_from_T_cm(
-            self.T_bc,
-            T_cm_meas,
-        )
+        observations = []
 
-        h = self.predicted_range_bearing(
-            mu,
-            marker_index,
-        )
+        # -----------------------------
+        # A. Jump landmarks
+        # -----------------------------
+        for i in range(1, len(ranges)):
+            r_prev = ranges[i - 1]
+            r_curr = ranges[i]
 
-        y = z - h
+            if abs(r_curr - r_prev) > self.jump_threshold:
+                # Παίρνουμε το πιο κοντινό από τα δύο σημεία ως edge point
+                idx = i if r_curr < r_prev else i - 1
 
-        y[1] = wrap_to_pi(y[1])
+                r = ranges[idx]
+                phi = angles[idx]
 
-        return y
+                if self.min_jump_range < r < self.max_jump_range:
+                    observations.append({
+                        "range": float(r),
+                        "bearing": float(normalize_angle(phi)),
+                        "type": "jump"
+                    })
 
-    def analytic_measurement_jacobian(
-        self,
-        mu: npt.ArrayLike,
-        marker_index: int,
-    ) -> ArrayF:
+        # -----------------------------
+        # B. Corner-like landmarks
+        # -----------------------------
+        s = self.corner_stride
+
+        for i in range(s, len(points) - s):
+            p_prev = points[i - s]
+            p = points[i]
+            p_next = points[i + s]
+
+            v1 = p_prev - p
+            v2 = p_next - p
+
+            norm1 = np.linalg.norm(v1)
+            norm2 = np.linalg.norm(v2)
+
+            if norm1 < 1e-6 or norm2 < 1e-6:
+                continue
+
+            cos_angle = np.dot(v1, v2) / (norm1 * norm2)
+            cos_angle = np.clip(cos_angle, -1.0, 1.0)
+
+            angle_deg = math.degrees(math.acos(cos_angle))
+
+            r = ranges[i]
+            phi = angles[i]
+
+            if self.corner_min_range < r < self.corner_max_range:
+                if self.corner_angle_min_deg < angle_deg < self.corner_angle_max_deg:
+                    observations.append({
+                        "range": float(r),
+                        "bearing": float(normalize_angle(phi)),
+                        "type": "corner"
+                    })
+
+        observations = self.filter_duplicate_observations(observations)
+
+        return observations
+
+    def filter_duplicate_observations(self, observations):
         """
-        Measurement Jacobian H.
+        Αφαιρεί landmarks που είναι σχεδόν στο ίδιο σημείο στο robot frame.
         """
 
-        mu = np.array(mu).reshape(self.state_dim)
+        filtered = []
 
-        x_r = mu[0]
-        y_r = mu[1]
+        for obs in observations:
+            r = obs["range"]
+            b = obs["bearing"]
 
-        sl = self.landmark_slice(marker_index)
+            px = r * math.cos(b)
+            py = r * math.sin(b)
 
-        mx = mu[sl.start]
-        my = mu[sl.start + 1]
+            too_close = False
 
-        dx = mx - x_r
-        dy = my - y_r
+            for kept in filtered:
+                kr = kept["range"]
+                kb = kept["bearing"]
 
-        q = dx**2 + dy**2
+                kx = kr * math.cos(kb)
+                ky = kr * math.sin(kb)
 
-        q = max(q, self.MIN_RANGE)
+                if math.hypot(px - kx, py - ky) < self.min_feature_separation:
+                    too_close = True
+                    break
 
-        sqrt_q = np.sqrt(q)
+            if not too_close:
+                filtered.append(obs)
 
-        H = np.zeros((2, self.state_dim))
+        return filtered
 
-        # range
+    # ======================================================
+    # EKF correction and data association
+    # ======================================================
+
+    def process_observation(self, obs):
+        z = np.array([
+            [obs["range"]],
+            [obs["bearing"]]
+        ])
+
+        if z[0, 0] < self.min_landmark_range or z[0, 0] > self.max_landmark_range:
+            return
+
+        if self.num_landmarks == 0:
+            self.handle_new_candidate(obs)
+            return
+
+        best_idx = None
+        best_d2 = float('inf')
+        best_H = None
+        best_innovation = None
+        best_S = None
+
+        for landmark_idx in range(self.num_landmarks):
+            z_hat, H = self.expected_observation_and_jacobian(landmark_idx)
+
+            innovation = z - z_hat
+            innovation[1, 0] = normalize_angle(innovation[1, 0])
+
+            S = H @ self.Sigma @ H.T + self.obs_noise
+
+            try:
+                d2 = float(innovation.T @ np.linalg.inv(S) @ innovation)
+            except np.linalg.LinAlgError:
+                continue
+
+            if d2 < best_d2:
+                best_d2 = d2
+                best_idx = landmark_idx
+                best_H = H
+                best_innovation = innovation
+                best_S = S
+
+        if best_idx is not None and best_d2 < self.mahalanobis_threshold:
+            self.correct(best_H, best_innovation, best_S)
+        else:
+            self.handle_new_candidate(obs)
+
+    def expected_observation_and_jacobian(self, landmark_idx):
+        """
+        Observation model:
+            z = h(mu) = [range, bearing]
+
+        Για landmark m_i = [mx, my]:
+
+            dx = mx - x
+            dy = my - y
+
+            range = sqrt(dx^2 + dy^2)
+            bearing = atan2(dy, dx) - theta
+        """
+
+        x = self.mu[0, 0]
+        y = self.mu[1, 0]
+        theta = self.mu[2, 0]
+
+        lm_start = 3 + 2 * landmark_idx
+
+        mx = self.mu[lm_start, 0]
+        my = self.mu[lm_start + 1, 0]
+
+        dx = mx - x
+        dy = my - y
+
+        q = dx ** 2 + dy ** 2
+
+        if q < 1e-8:
+            q = 1e-8
+
+        sqrt_q = math.sqrt(q)
+
+        z_hat = np.array([
+            [sqrt_q],
+            [normalize_angle(math.atan2(dy, dx) - theta)]
+        ])
+
+        n = self.mu.shape[0]
+        H = np.zeros((2, n))
+
+        # Derivatives ως προς robot pose x, y, theta
         H[0, 0] = -dx / sqrt_q
         H[0, 1] = -dy / sqrt_q
+        H[0, 2] = 0.0
 
-        H[0, sl.start] = dx / sqrt_q
-        H[0, sl.start + 1] = dy / sqrt_q
-
-        # bearing
         H[1, 0] = dy / q
         H[1, 1] = -dx / q
         H[1, 2] = -1.0
 
-        H[1, sl.start] = -dy / q
-        H[1, sl.start + 1] = dx / q
+        # Derivatives ως προς landmark mx, my
+        H[0, lm_start] = dx / sqrt_q
+        H[0, lm_start + 1] = dy / sqrt_q
 
-        return H
+        H[1, lm_start] = -dy / q
+        H[1, lm_start + 1] = dx / q
 
-    def initialize_landmark(
-        self,
-        mu: npt.ArrayLike,
-        Sigma: npt.ArrayLike,
-        marker_index: int,
-        T_cm_meas: npt.ArrayLike,
-    ):
+        return z_hat, H
+
+    def correct(self, H, innovation, S):
         """
-        Initialize landmark in world frame.
+        EKF correction:
+            K = Sigma H^T (H Sigma H^T + Q)^-1
+            mu = mu + K innovation
+            Sigma = (I - K H) Sigma
         """
 
-        T_wb = pose2d_to_Twb(
-            mu[0],
-            mu[1],
-            mu[2],
+        K = self.Sigma @ H.T @ np.linalg.inv(S)
+
+        self.mu = self.mu + K @ innovation
+        self.mu[2, 0] = normalize_angle(self.mu[2, 0])
+
+        n = self.mu.shape[0]
+        I = np.eye(n)
+
+        self.Sigma = (I - K @ H) @ self.Sigma
+
+    # ======================================================
+    # New landmark handling
+    # ======================================================
+
+    def handle_new_candidate(self, obs):
+        """
+        Δεν προσθέτουμε αμέσως κάθε παρατήρηση στο EKF state.
+        Την κρατάμε ως candidate και αν την ξαναδούμε κοντά,
+        τότε τη βάζουμε ως πραγματικό landmark.
+        """
+
+        pos_world = self.observation_to_world(obs)
+
+        # Αν είναι πολύ κοντά σε υπάρχον landmark, μην το προσθέσεις
+        for k in range(self.num_landmarks):
+            lm_start = 3 + 2 * k
+            lm_pos = self.mu[lm_start:lm_start + 2, 0]
+
+            if np.linalg.norm(pos_world - lm_pos) < self.new_landmark_min_distance:
+                return
+
+        # Match με ήδη provisional candidate
+        for cand in self.candidate_landmarks:
+            if np.linalg.norm(pos_world - cand["position"]) < self.candidate_match_distance:
+                cand["position"] = 0.5 * cand["position"] + 0.5 * pos_world
+                cand["seen"] += 1
+
+                if cand["seen"] >= self.candidate_required_seen:
+                    self.add_landmark(cand["position"])
+                    self.candidate_landmarks.remove(cand)
+
+                return
+
+        # Νέο candidate
+        self.candidate_landmarks.append({
+            "position": pos_world,
+            "seen": 1,
+            "type": obs["type"]
+        })
+
+    def observation_to_world(self, obs):
+        """
+        Μετατρέπει observation [range, bearing] από robot frame σε world frame.
+        """
+
+        r = obs["range"]
+        b = obs["bearing"]
+
+        x = self.mu[0, 0]
+        y = self.mu[1, 0]
+        theta = self.mu[2, 0]
+
+        global_angle = theta + b
+
+        mx = x + r * math.cos(global_angle)
+        my = y + r * math.sin(global_angle)
+
+        return np.array([mx, my])
+
+    def add_landmark(self, position):
+        """
+        Προσθήκη νέου landmark στο EKF state.
+        """
+
+        mx, my = position
+
+        old_n = self.mu.shape[0]
+        new_n = old_n + 2
+
+        new_mu = np.zeros((new_n, 1))
+        new_mu[:old_n, :] = self.mu
+        new_mu[old_n, 0] = mx
+        new_mu[old_n + 1, 0] = my
+
+        new_Sigma = np.zeros((new_n, new_n))
+        new_Sigma[:old_n, :old_n] = self.Sigma
+
+        # Αρχική αβεβαιότητα νέου landmark
+        new_Sigma[old_n, old_n] = 0.50 ** 2
+        new_Sigma[old_n + 1, old_n + 1] = 0.50 ** 2
+
+        self.mu = new_mu
+        self.Sigma = new_Sigma
+        self.num_landmarks += 1
+
+        self.get_logger().info(
+            f'Added landmark #{self.num_landmarks}: ({mx:.2f}, {my:.2f})'
         )
 
-        T_wc = T_wb @ self.T_bc
+    # ======================================================
+    # Occupancy grid mapping
+    # ======================================================
 
-        T_wm = T_wc @ T_cm_meas
-
-        mx = T_wm[0, 3]
-        my = T_wm[1, 3]
-
-        mu_landmark = np.array([mx, my])
-
-        # simple initialization covariance
-        Sigma_landmark = np.diag([
-            0.05**2,
-            0.05**2,
-        ])
-
-        return mu_landmark, Sigma_landmark
-
-    def prediction_step(
-        self,
-        u_body: np.ndarray,
-        dt: float,
-    ) -> None:
+    def update_occupancy_grid(self, scan: LaserScan):
         """
-        EKF prediction.
+        Απλό inverse sensor model:
+            cells πάνω στην ακτίνα μέχρι το hit -> free
+            τελικό cell -> occupied
         """
 
-        vx, vy, omega = np.array(
-            u_body,
-            dtype=float,
-        ).reshape(3)
+        robot_x = self.mu[0, 0]
+        robot_y = self.mu[1, 0]
+        robot_theta = self.mu[2, 0]
 
-        mu_robot_pred, F_r = (
-            self._motion_model_callback(
-                mu=self._mu[:3],
-                vx=vx,
-                vy=vy,
-                omega=omega,
-                dt=dt,
-                velocities_in_body_frame=True,
-            )
-        )
+        robot_cell = self.world_to_cell(robot_x, robot_y)
 
-        self._mu[:3] = mu_robot_pred
+        if robot_cell is None:
+            return
 
-        # full Jacobian
-        F = np.eye(self.state_dim)
-
-        F[:3, :3] = F_r
-
-        # process noise
-        R_full = np.zeros(
-            (self.state_dim, self.state_dim)
-        )
-
-        R_full[:3, :3] = self._R
-
-        self._Sigma = (
-            F
-            @ self._Sigma
-            @ F.T
-            + R_full
-        )
-
-    def correction_step(
-        self,
-        detections: Iterable[Detection],
-    ) -> None:
-        """
-        EKF correction using ArUco detections.
-        """
-
-        I = np.eye(self.state_dim)
-
-        mu_bar = self._mu.copy()
-        Sigma_bar = self._Sigma.copy()
-
-        for marker_id, T_cm_meas in detections:
-
-            # invalid marker id
-            if (
-                marker_id < 0
-                or marker_id >= self.max_markers
-            ):
-
-                warnings.warn(
-                    f"Ignoring invalid marker_id={marker_id}",
-                    RuntimeWarning,
-                )
-
+        for i, r in enumerate(scan.ranges):
+            if math.isnan(r) or math.isinf(r):
                 continue
 
-            # first observation
-            if not self._marker_seen[marker_id]:
+            if r < scan.range_min:
+                continue
 
-                mu_landmark, Sigma_landmark = (
-                    self.initialize_landmark(
-                        mu_bar,
-                        Sigma_bar,
-                        marker_id,
-                        T_cm_meas,
+            hit = True
+
+            if r > self.max_mapping_range:
+                r = self.max_mapping_range
+                hit = False
+
+            angle = scan.angle_min + i * scan.angle_increment
+            global_angle = robot_theta + angle
+
+            end_x = robot_x + r * math.cos(global_angle)
+            end_y = robot_y + r * math.sin(global_angle)
+
+            end_cell = self.world_to_cell(end_x, end_y)
+
+            if end_cell is None:
+                continue
+
+            cells = self.bresenham(robot_cell[0], robot_cell[1], end_cell[0], end_cell[1])
+
+            if len(cells) == 0:
+                continue
+
+            # Free cells, εκτός από το τελευταίο
+            for cx, cy in cells[:-1]:
+                if self.valid_cell(cx, cy):
+                    self.log_odds[cy, cx] += self.log_free
+                    self.log_odds[cy, cx] = np.clip(
+                        self.log_odds[cy, cx],
+                        self.log_min,
+                        self.log_max
                     )
-                )
+                    self.known[cy, cx] = True
 
-                sl = self.landmark_slice(marker_id)
+            # Occupied τελικό cell
+            if hit:
+                cx, cy = cells[-1]
+                if self.valid_cell(cx, cy):
+                    self.log_odds[cy, cx] += self.log_occ
+                    self.log_odds[cy, cx] = np.clip(
+                        self.log_odds[cy, cx],
+                        self.log_min,
+                        self.log_max
+                    )
+                    self.known[cy, cx] = True
 
-                mu_bar[sl] = mu_landmark
+    def world_to_cell(self, x, y):
+        cx = int((x - self.map_origin_x) / self.map_resolution)
+        cy = int((y - self.map_origin_y) / self.map_resolution)
 
-                Sigma_bar[sl, sl] = Sigma_landmark
+        if not self.valid_cell(cx, cy):
+            return None
 
-                self._marker_seen[marker_id] = True
+        return cx, cy
 
-                continue
+    def valid_cell(self, cx, cy):
+        return 0 <= cx < self.map_width and 0 <= cy < self.map_height
 
-            # innovation
-            y = self.measurement_residual(
-                mu_bar,
-                marker_id,
-                T_cm_meas,
-            )
-
-            # Jacobian
-            H = self.analytic_measurement_jacobian(
-                mu_bar,
-                marker_id,
-            )
-
-            # innovation covariance
-            S = (
-                H
-                @ Sigma_bar
-                @ H.T
-                + self._Q
-            )
-
-            # Kalman gain
-            K = (
-                Sigma_bar
-                @ H.T
-                @ np.linalg.solve(
-                    S,
-                    np.eye(2),
-                )
-            )
-
-            # state update
-            mu_bar = mu_bar + K @ y
-
-            mu_bar[2] = wrap_to_pi(mu_bar[2])
-
-            # covariance update
-            Sigma_bar = (
-                I - K @ H
-            ) @ Sigma_bar
-
-        self._mu = mu_bar
-        self._Sigma = Sigma_bar
-
-    def step(
-        self,
-        u_body: npt.ArrayLike,
-        detections: Iterable[Detection],
-        dt: float,
-    ) -> None:
+    def bresenham(self, x0, y0, x1, y1):
         """
-        Full EKF-SLAM step.
+        Bresenham line algorithm για grid ray tracing.
         """
 
-        self.prediction_step(
-            u_body,
-            dt,
-        )
+        cells = []
 
-        self.correction_step(
-            detections,
-        )
+        dx = abs(x1 - x0)
+        dy = abs(y1 - y0)
+
+        sx = 1 if x0 < x1 else -1
+        sy = 1 if y0 < y1 else -1
+
+        err = dx - dy
+
+        x = x0
+        y = y0
+
+        while True:
+            cells.append((x, y))
+
+            if x == x1 and y == y1:
+                break
+
+            e2 = 2 * err
+
+            if e2 > -dy:
+                err -= dy
+                x += sx
+
+            if e2 < dx:
+                err += dx
+                y += sy
+
+        return cells
+
+    # ======================================================
+    # Publishers
+    # ======================================================
+
+    def publish_pose(self):
+        msg = PoseWithCovarianceStamped()
+
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = 'map'
+
+        x = self.mu[0, 0]
+        y = self.mu[1, 0]
+        theta = self.mu[2, 0]
+
+        msg.pose.pose.position.x = float(x)
+        msg.pose.pose.position.y = float(y)
+        msg.pose.pose.position.z = 0.0
+
+        msg.pose.pose.orientation.z = math.sin(theta / 2.0)
+        msg.pose.pose.orientation.w = math.cos(theta / 2.0)
+
+        cov = np.zeros(36)
+
+        cov[0] = self.Sigma[0, 0]
+        cov[1] = self.Sigma[0, 1]
+        cov[5] = self.Sigma[0, 2]
+
+        cov[6] = self.Sigma[1, 0]
+        cov[7] = self.Sigma[1, 1]
+        cov[11] = self.Sigma[1, 2]
+
+        cov[30] = self.Sigma[2, 0]
+        cov[31] = self.Sigma[2, 1]
+        cov[35] = self.Sigma[2, 2]
+
+        msg.pose.covariance = cov.tolist()
+
+        self.pose_pub.publish(msg)
+
+    def publish_landmarks(self):
+        marker_array = MarkerArray()
+
+        # Clear old markers
+        clear_marker = Marker()
+        clear_marker.action = Marker.DELETEALL
+        marker_array.markers.append(clear_marker)
+
+        for k in range(self.num_landmarks):
+            lm_start = 3 + 2 * k
+
+            mx = self.mu[lm_start, 0]
+            my = self.mu[lm_start + 1, 0]
+
+            marker = Marker()
+            marker.header.stamp = self.get_clock().now().to_msg()
+            marker.header.frame_id = 'map'
+
+            marker.ns = 'ekf_landmarks'
+            marker.id = k
+            marker.type = Marker.SPHERE
+            marker.action = Marker.ADD
+
+            marker.pose.position.x = float(mx)
+            marker.pose.position.y = float(my)
+            marker.pose.position.z = 0.0
+            marker.pose.orientation.w = 1.0
+
+            marker.scale.x = 0.12
+            marker.scale.y = 0.12
+            marker.scale.z = 0.12
+
+            marker.color.r = 1.0
+            marker.color.g = 0.1
+            marker.color.b = 0.1
+            marker.color.a = 1.0
+
+            marker_array.markers.append(marker)
+
+        self.landmark_pub.publish(marker_array)
+
+    def publish_map(self):
+        msg = OccupancyGrid()
+
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = 'map'
+
+        msg.info.resolution = self.map_resolution
+        msg.info.width = self.map_width
+        msg.info.height = self.map_height
+
+        msg.info.origin.position.x = self.map_origin_x
+        msg.info.origin.position.y = self.map_origin_y
+        msg.info.origin.position.z = 0.0
+        msg.info.origin.orientation.w = 1.0
+
+        data = []
+
+        for y in range(self.map_height):
+            for x in range(self.map_width):
+                if not self.known[y, x]:
+                    data.append(-1)
+                else:
+                    p = 1.0 - 1.0 / (1.0 + math.exp(self.log_odds[y, x]))
+                    occ = int(round(100.0 * p))
+                    occ = max(0, min(100, occ))
+                    data.append(occ)
+
+        msg.data = data
+
+        self.map_pub.publish(msg)
+
+
+def main(args=None):
+    rclpy.init(args=args)
+
+    node = EKFLidarSLAM()
+
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+
+    node.destroy_node()
+    rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()

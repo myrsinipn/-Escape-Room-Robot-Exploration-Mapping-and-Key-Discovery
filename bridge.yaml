@@ -1,0 +1,34 @@
+topics:
+  -
+    topic: /odom
+    type: nav_msgs/msg/Odometry
+    queue_size: 10
+
+  -
+    topic: /imu
+    type: sensor_msgs/msg/Imu
+    queue_size: 10
+
+  -
+    topic: /robot_pose_ekf/odom_combined
+    type: nav_msgs/msg/Odometry
+    queue_size: 10
+
+  -
+    topic: /cmd_vel
+    type: geometry_msgs/msg/Twist
+    queue_size: 10
+
+  -
+    topic: /tf
+    type: tf2_msgs/msg/TFMessage
+    queue_size: 100
+
+  -
+    topic: /tf_static
+    type: tf2_msgs/msg/TFMessage
+    queue_size: 100
+  -
+    topic: /scan
+    type: sensor_msgs/msg/LaserScan
+    queue_size: 10

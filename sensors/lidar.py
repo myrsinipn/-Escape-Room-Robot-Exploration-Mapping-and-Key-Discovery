@@ -57,25 +57,12 @@ class LidarSensor(Node):
         )
 
     def lidar_callback(self, msg: LaserScan) -> None:
-        """
-        Callback for incoming LaserScan messages.
-        """
-
         ranges = np.array(msg.ranges, dtype=np.float32)
 
-        # Replace invalid values
+        # Only replace NaN/inf — ScanPreprocessor owns all clipping logic
         invalid_mask = np.isnan(ranges) | np.isinf(ranges)
-
         ranges[invalid_mask] = self.max_range
 
-        # Clip ranges
-        ranges = np.clip(
-            ranges,
-            self.min_range,
-            self.max_range,
-        )
-
-        # Generate angles
         angles = np.arange(
             msg.angle_min,
             msg.angle_max,
@@ -83,15 +70,11 @@ class LidarSensor(Node):
             dtype=np.float32,
         )
 
-        # Ensure equal lengths
         min_len = min(len(ranges), len(angles))
-
         self._ranges = ranges[:min_len]
         self._angles = angles[:min_len]
-
         self._timestamp = time.time()
 
-        # store metadata
         self._angle_min = msg.angle_min
         self._angle_max = msg.angle_max
         self._angle_increment = msg.angle_increment

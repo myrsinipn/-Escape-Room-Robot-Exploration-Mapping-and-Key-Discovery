@@ -62,39 +62,42 @@ class ScanPreprocessor:
             "angles": angles,
             "timestamp": scan["timestamp"],
         }
-
-    def remove_invalid_ranges(
-        self,
-        ranges: np.ndarray,
-    ) -> np.ndarray:
-        """
-        Replace NaN and inf values.
-        """
-
+    def remove_invalid_ranges(self, ranges: np.ndarray) -> np.ndarray:
+        """Replace NaN and inf with max_range. Leave below-min as-is."""
         cleaned = ranges.copy()
-
-        invalid_mask = (
-            np.isnan(cleaned)
-            | np.isinf(cleaned)
-        )
-
+        invalid_mask = np.isnan(cleaned) | np.isinf(cleaned)
         cleaned[invalid_mask] = self.max_range
-
         return cleaned
 
-    def clip_ranges(
-        self,
-        ranges: np.ndarray,
-    ) -> np.ndarray:
-        """
-        Clip ranges to valid interval.
-        """
+    def clip_ranges(self, ranges: np.ndarray) -> np.ndarray:
+        """Only cap at max_range — do not clip up from below."""
+        return np.minimum(ranges, self.max_range)
 
-        return np.clip(
-            ranges,
-            self.min_range,
-            self.max_range,
+    def get_sector_min(
+        self,
+        processed_scan: dict,
+        angle_min_deg: float,
+        angle_max_deg: float,
+    ) -> float:
+        """
+        Minimum range in angular sector, skipping readings outside
+        [min_range, max_range] — mirrors original prototype logic exactly.
+        """
+        ranges = processed_scan["ranges"]
+        angles_deg = np.degrees(processed_scan["angles"])
+        angles_deg = (angles_deg + 180) % 360 - 180  # normalize to [-180, 180]
+
+        valid_mask = (
+            (ranges >= self.min_range)
+            & (ranges <= self.max_range)
+            & (angles_deg >= angle_min_deg)
+            & (angles_deg <= angle_max_deg)
         )
+
+        sector_ranges = ranges[valid_mask]
+        if len(sector_ranges) == 0:
+            return float('inf')
+        return float(np.min(sector_ranges))
 
     def smooth_scan(
         self,
@@ -137,3 +140,4 @@ class ScanPreprocessor:
         points = np.column_stack((x, y))
 
         return points
+  
