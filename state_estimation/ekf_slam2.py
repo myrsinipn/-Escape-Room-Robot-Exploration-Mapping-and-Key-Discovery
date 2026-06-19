@@ -42,7 +42,6 @@ from sensors.lidar    import LidarSensor
 from sensors.odometry import OdometrySensor
 from perception.scan_preprocessor import ScanPreprocessor
 from perception.motion_model       import OmniMotionModel
-import threading
 
 import traceback
 
@@ -80,7 +79,6 @@ class EKFLidarSLAM(Node):
         # Debug counters
         self.total_corner_detections = 0
         self.total_confirmed_corners = 0
-        self.map_lock = threading.Lock()
 
         # ----------------------------------------------------------------
         # EKF state
@@ -91,6 +89,12 @@ class EKFLidarSLAM(Node):
         # Αλλαγή: αρχικοποίηση mu από odom
         #self.mu_initialized = False  # προσθήκη flag
         self.mu = np.zeros((3, 1))
+        odom_pose = self.odom.get_pose()        # <-- ΠΡΟΣΑΡΜΟΓΗ στο δικό σου API
+        if odom_pose is not None:
+            self.mu[0, 0] = float(odom_pose["pose"][0])
+            self.mu[1, 0] = float(odom_pose["pose"][1])
+            self.mu[2, 0] = float(odom_pose["pose"][2])
+
         self.num_landmarks = 0
 
         # Sigma: initial robot pose uncertainty (small — we start at origin)
@@ -106,15 +110,15 @@ class EKFLidarSLAM(Node):
 
         # R — motion noise added to the robot pose block each prediction step
         self.motion_noise = np.diag([
-            0.01,                   # x noise std = 3 cm
-            0.01,                   # y noise std = 3 cm
-            math.radians(1.0),      # theta noise std = 2 deg
+            0.03,                   # x noise std = 3 cm
+            0.03,                   # y noise std = 3 cm
+            math.radians(2.0),      # theta noise std = 2 deg
         ]) ** 2
 
         # Q — observation noise for a single measurement z = [range, bearing]
         self.obs_noise = np.diag([
-            0.3,                   # range noise std = 10 cm
-            math.radians(15.0),      # bearing noise std = 5 deg
+            0.10,                   # range noise std = 10 cm
+            math.radians(5.0),      # bearing noise std = 5 deg
         ]) ** 2
 
         # ----------------------------------------------------------------
@@ -141,7 +145,7 @@ class EKFLidarSLAM(Node):
         # ----------------------------------------------------------------
         self.candidate_landmarks    = []    # list of dicts
         self.candidate_match_dist   = 0.5  # metres — same feature?
-        self.candidate_required_seen = 10    # how many sightings needed
+        self.candidate_required_seen = 5    # how many sightings needed
 
         # ----------------------------------------------------------------
         # LiDAR feature extraction parameters
@@ -266,26 +270,9 @@ class EKFLidarSLAM(Node):
         # even if odometry messages arrive less frequently.
         current_time = self.get_clock().now().nanoseconds * 1e-9
 
-        if self.prev_odom_timestamp is None:
-                    # seed slam pose from the first odom pose so the two overlay
-                    odom_pose = self.odom.get_pose()        # <-- ΠΡΟΣΑΡΜΟΓΗ στο δικό σου API
-                    if odom_pose is not None:
-                        self.mu[0, 0] = float(odom_pose["pose"][0])
-                        self.mu[1, 0] = float(odom_pose["pose"][1])
-                        self.mu[2, 0] = float(odom_pose["pose"][2])
-                    self.prev_odom_timestamp = current_time
-                    return
-
-        dt = current_time - self.prev_odom_timestamp
-        self.prev_odom_timestamp = current_time
-
-        # Skip weird time jumps
-        if not (0.0 < dt <= 0.20):
-            return
 
         vx, vy, omega = vel_data["velocity"]
 
-        self.get_logger().info(f"PRED vx={vx:.3f} vy={vy:.3f} w={omega:.3f} dt={dt:.3f}")
         # -- State update --
         # OmniMotionModel computes the new pose and the 3x3 Jacobian F
         # using the omni-drive kinematics:
@@ -320,7 +307,6 @@ class EKFLidarSLAM(Node):
         # EKF covariance prediction:  Sigma = F Sigma F^T + R
         self.Sigma = F_full @ self.Sigma @ F_full.T + R_full
 
-        self.get_logger().info(f"SLAM x={self.mu[0,0]:.2f} y={self.mu[1,0]:.2f} th={math.degrees(self.mu[2,0]):.0f}")
 
     # ====================================================================
     # STEP 2 — CORRECTION
@@ -353,7 +339,7 @@ class EKFLidarSLAM(Node):
             # Extract geometric features from the scan
             observations = self.extract_lidar_landmarks(points, ranges, angles)
 
-            # # Run EKF correction for each observation
+            # Run EKF correction for each observation
             for obs in observations:
                 self.process_observation(obs)
 
@@ -527,24 +513,12 @@ class EKFLidarSLAM(Node):
                 best_S            = S
 
         # --- Decision: update or new candidate ---------------------------
-               # --- Decision: update or new candidate ---------------------------
-        good_match = (
-            best_landmark_idx is not None
-            and best_distance_sq < self.mahal_threshold
-            and abs(best_innovation[0, 0]) < 0.5                 # range diff < 0.5 m
-            and abs(best_innovation[1, 0]) < math.radians(20.0) # bearing diff < 20 deg
-        )
-
-        no_match = (
-            best_landmark_idx is None
-            or best_distance_sq >= self.mahal_threshold
-        )
-
-        if good_match:
+        if best_landmark_idx is not None and best_distance_sq < self.mahal_threshold:
+            # Good match → correct the state
             self.ekf_correct(best_H, best_innovation, best_S)
-        elif no_match:
+        else:
+            # No match → might be a new landmark
             self.add_to_candidate_buffer(obs)
-        # αλλιώς: ταίριασμα μέσα στο gate αλλά με μεγάλο innovation → ύποπτο, το αγνοούμε
 
     def observation_model(self, landmark_idx: int):
         """
@@ -726,6 +700,7 @@ class EKFLidarSLAM(Node):
     #
     # Updates are additive in log-odds space and clamped to [min, max].
     # ====================================================================
+
     def update_occupancy_grid(self, ranges: np.ndarray, angles: np.ndarray) -> None:
 
         robot_x     = self.mu[0, 0]
@@ -736,47 +711,47 @@ class EKFLidarSLAM(Node):
         if robot_cell is None:
             return   # robot is outside the map
 
-        with self.map_lock:
-            for r, phi in zip(ranges, angles):
+        for r, phi in zip(ranges, angles):
 
-                # Rays that exceed max range don't give us an occupied endpoint
-                is_hit = True
-                if r > self.max_mapping_range:
-                    r      = self.max_mapping_range
-                    is_hit = False
+            # Rays that exceed max range don't give us an occupied endpoint
+            is_hit = True
+            if r > self.max_mapping_range:
+                r      = self.max_mapping_range
+                is_hit = False
 
-                if r < self.scan_preprocessor.min_range:
-                    continue   # too close — unreliable
+            if r < self.scan_preprocessor.min_range:
+                continue   # too close — unreliable
 
-                # Endpoint in world frame
-                global_angle = robot_theta + float(phi)
-                end_x = robot_x + r * math.cos(global_angle)
-                end_y = robot_y + r * math.sin(global_angle)
+            # Endpoint in world frame
+            global_angle = robot_theta + float(phi)
+            end_x = robot_x + r * math.cos(global_angle)
+            end_y = robot_y + r * math.sin(global_angle)
 
-                end_cell = self.world_to_grid_cell(end_x, end_y)
-                if end_cell is None:
-                    continue   # endpoint outside map
+            end_cell = self.world_to_grid_cell(end_x, end_y)
+            if end_cell is None:
+                continue   # endpoint outside map
 
-                # Trace the ray through the grid
-                ray_cells = self.bresenham_line(robot_cell[0], robot_cell[1],
-                                                end_cell[0],   end_cell[1])
+            # Trace the ray through the grid
+            ray_cells = self.bresenham_line(robot_cell[0], robot_cell[1],
+                                            end_cell[0],   end_cell[1])
 
-                # All cells except the last one are free space
-                for cx, cy in ray_cells[:-1]:
-                    if self.cell_in_bounds(cx, cy):
-                        self.log_odds[cy, cx] = np.clip(
-                            self.log_odds[cy, cx] + self.log_odds_free,
-                            self.log_odds_min, self.log_odds_max)
-                        self.cells_observed[cy, cx] = True
+            # All cells except the last one are free space
+            for cx, cy in ray_cells[:-1]:
+                if self.cell_in_bounds(cx, cy):
+                    self.log_odds[cy, cx] = np.clip(
+                        self.log_odds[cy, cx] + self.log_odds_free,
+                        self.log_odds_min, self.log_odds_max)
+                    self.cells_observed[cy, cx] = True
 
-                # The last cell is occupied (only if the ray actually hit something)
-                if is_hit:
-                    cx, cy = ray_cells[-1]
-                    if self.cell_in_bounds(cx, cy):
-                        self.log_odds[cy, cx] = np.clip(
-                            self.log_odds[cy, cx] + self.log_odds_occ,
-                            self.log_odds_min, self.log_odds_max)
-                        self.cells_observed[cy, cx] = True
+            # The last cell is occupied (only if the ray actually hit something)
+            if is_hit:
+                cx, cy = ray_cells[-1]
+                if self.cell_in_bounds(cx, cy):
+                    self.log_odds[cy, cx] = np.clip(
+                        self.log_odds[cy, cx] + self.log_odds_occ,
+                        self.log_odds_min, self.log_odds_max)
+                    self.cells_observed[cy, cx] = True
+
     def world_to_grid_cell(self, x: float, y: float):
         """Convert world coordinates (metres) to grid cell indices (cx, cy)."""
         cx = int((x - self.map_origin_x) / self.map_resolution)
@@ -924,9 +899,9 @@ class EKFLidarSLAM(Node):
     @property
     def occupancy_grid(self) -> np.ndarray:
         """Log-odds grid (map_height x map_width, float32). Positive = occupied."""
-        return self.log_odds.copy()
+        return self.log_odds
 
     @property
     def known_cells(self) -> np.ndarray:
         """Boolean mask — True where a cell has been observed at least once."""
-        return self.cells_observed.copy()
+        return self.cells_observed
