@@ -71,15 +71,33 @@ while True:
                 label="Target",
             )
 
-        # ── Live robot pose (20 Hz from SLAM) ────────────────────────
+        # ── Live robot pose & SLAM Landmarks (20 Hz) ─────────────────
         robot = None
+        landmarks = []
         try:
             with open("/tmp/slam_pose.json", "r") as f:
                 robot = json.load(f)
             trail_x.append(robot["x"])
             trail_y.append(robot["y"])
+            # Load the exposed map features
+            landmarks = robot.get("landmarks", [])
         except Exception:
             robot = data.get("robot")   # fallback to rrt_debug snapshot
+
+        # ── Draw SLAM Map Features ───────────────────────────────────
+        if len(landmarks) > 0:
+            lx = [lm[0] for lm in landmarks]
+            ly = [lm[1] for lm in landmarks]
+            ax.scatter(
+                lx, ly,
+                s=80,
+                color="crimson",
+                marker="s",
+                edgecolors="black",
+                linewidths=0.5,
+                zorder=4,
+                label=f"SLAM Landmarks ({len(landmarks)})"
+            )
 
         if robot is not None:
             rx = robot["x"]
@@ -133,7 +151,7 @@ while True:
         # ── Stats overlay ────────────────────────────────────────────
         tree_size   = len(data.get("tree", []))
         path_len    = len(path)
-        stats_text  = f"Tree edges: {tree_size}  |  Path pts: {path_len}"
+        stats_text  = f"Tree edges: {tree_size}  |  Path pts: {path_len}  |  Map Features: {len(landmarks)}"
         ax.set_title(stats_text, fontsize=10)
 
         ax.set_xlabel("X (m)")
@@ -147,9 +165,9 @@ while True:
         plt.pause(0.05)
 
     except FileNotFoundError:
-        # rrt_debug.json not written yet — just wait
+        # data files not written yet — just wait
         ax.clear()
-        ax.set_title("Waiting for /tmp/rrt_debug.json ...")
+        ax.set_title("Waiting for debug json maps ...")
         plt.draw()
         plt.pause(0.5)
 
