@@ -11,7 +11,7 @@ from rclpy.executors import MultiThreadedExecutor
 from geometry_msgs.msg import Twist
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from mapping.rrt_exploration  import RRTExplorer
-from control.path_follower    import PathFollower
+#from control.path_follower    import PathFollower
 from sensors.lidar    import LidarSensor
 from sensors.camera   import CameraSensor
 from sensors.odometry import OdometrySensor
@@ -72,22 +72,24 @@ def main() -> None:
         motion_model=motion_model,
     )
 
-    path_follower = PathFollower(
-        slam,
-        lidar=lidar,
-        preprocessor=preprocessor
-    )
+    # path_follower = PathFollower(
+    #     slam,
+    #     lidar=lidar,
+    #     preprocessor=preprocessor
+    # )
 
     rrt = RRTExplorer(
         slam=slam,
-        step_size=0.15,                 # Sliced from 0.35 -> 0.15m (3 cells) so branches can navigate tight corridors
-        max_iterations=1200,            # Raised from 600 -> 1200 to give the shorter steps plenty of growth attempts
+        lidar=lidar,                    # NEW
+        preprocessor=preprocessor,      # NEW
+        step_size=0.15,
+        max_iterations=1200,
         frontier_cluster_radius=0.6,
-        robot_radius_cells=1,           
-        sampling_padding_cells=45,      
-        slam_map_topic="/slam_map",     
-        min_known_cells=500,             
-        min_plan_interval=2.0,          
+        robot_radius_cells=3,
+        sampling_padding_cells=15,
+        slam_map_topic="/slam_map",
+        min_known_cells=800,
+        min_plan_interval=2.0,
     )
 
     aruco_monitor = ArucoMonitor(
@@ -99,8 +101,9 @@ def main() -> None:
 
     # ── Wire explorer ↔ follower ─────────────────────
 
-    rrt.path_follower = path_follower
-    path_follower.explorer = rrt
+    #rrt.path_follower = path_follower
+    #path_follower.explorer = rrt
+    rrt._cmd_pub.publish(Twist())
 
     # ── Executor ──────────────────────────────────────────────────────
     executor = MultiThreadedExecutor()
@@ -109,7 +112,6 @@ def main() -> None:
         camera,
         odom,
         aruco_monitor,
-        path_follower,
         slam,
         rrt
     ]:

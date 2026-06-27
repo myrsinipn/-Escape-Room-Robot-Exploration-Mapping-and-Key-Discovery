@@ -1,115 +1,73 @@
 #!/usr/bin/env python3
 """
-RRT-based frontier explorer — SLAM OccupancyGrid edition.
+RRT-based frontier explorer  +  integrated path follower.
+============================================================
 
-Architecture change vs previous version
+This node both PLANS exploration paths (RRT over the EKF-SLAM
+OccupancyGrid) and FOLLOWS them itself — no separate PathFollower node,
+no notify_path_done() wiring across nodes.
+
+How planning and following are coordinated
+------------------------------------------
+  Two timers, one shared flag (_path_executing):
+
+    _tick()          @ 0.5 s   — PLANNING.  Runs only when _path_executing
+                                 is False.  Plans a path, publishes it to
+                                 /exploration_path (for RViz), stores it
+                                 internally, and sets _path_executing=True.
+
+    _control_loop()  @ 20 Hz   — FOLLOWING.  Runs only when _path_executing
+                                 is True.  Drives the robot waypoint by
+                                 waypoint.  When the path finishes (reached
+                                 or stuck) it calls _on_path_done(reason),
+                                 which clears _path_executing so the next
+                                 _tick() can plan again.
+
+  Because _on_path_done() is an internal method, the old cross-node
+  notify_path_done() contract is preserved exactly: a stuck path still
+  blacklists its goal, a completed path still frees the planner.
+
+Following logic (simplified per request)
 ----------------------------------------
-The RRT no longer builds its own costmap from /scan.
-It subscribes to /slam_map (nav_msgs/OccupancyGrid) published by the
-EKF-SLAM node and uses that grid directly for:
-  - collision checking  (obstacle cells)
-  - frontier detection  (unknown / -1 cells)
-  - sampling bounds     (bounding box of known cells)
+  Motion model: DIFFERENTIAL-STYLE (no lateral strafe)
+    linear.x  = forward only (proportional to distance to waypoint)
+    linear.y  = always 0.0
+    angular.z = heading correction
 
-Removed entirely
-  - _scan_callback, _costmap_hit, _costmap_seen, _costmap_lock
-  - map_build_delay (replaced by a minimum known-cell threshold)
-  - LaserScan import
+  Obstacle avoidance: EMERGENCY tier ONLY.
+    If something is closer than EMERGENCY_FRONT_DIST in front, stop all
+    translation and spin in place toward the more open side until clear.
+    The SLOW and NORMAL "nudge" tiers are intentionally removed — the RRT
+    path is already collision-checked, and keeping only EMERGENCY makes
+    the follow behaviour easy to reason about while debugging.
 
-Cell classification (tunable — see FREE_MAX / OBSTACLE_MIN below)
-  -1        → frontier   (unknown, never seen by SLAM)
-   0 .. 30  → free       (confirmed clear)
-  31 .. 100 → obstacle   (uncertain or confirmed occupied)
-
-Everything else (RRT tree growth, backtrack, frontier scoring,
-blacklist, return-to-origin, path publishing) is unchanged.
+Everything about the RRT planner itself (tree growth, frontier scoring,
+blacklist, return-to-origin, cell classification) is UNCHANGED from the
+standalone version.
 
 TUNING GUIDE
 ════════════════════════════════════════════════════════════════════════
 
 ── Cell classification thresholds ───────────────────────────────────
-  FREE_MAX      (default 30)
-      SLAM cells with value 0..FREE_MAX are treated as free/traversable.
-      SYMPTOM too high: robot enters uncertain areas and clips obstacles.
-      SYMPTOM too low: most of the map is treated as obstacle; tree
-        can barely grow; very few frontiers found.
-      GOOD RANGE: 20–40.  Start at 30.
+  FREE_MAX      (default 30)   cells 0..FREE_MAX are free/traversable
+  OBSTACLE_MIN  (default 31)   cells OBSTACLE_MIN..100 are obstacle
+  UNKNOWN_VAL   (-1)           exactly -1 is a frontier (unseen)
 
-  OBSTACLE_MIN  (default 31)
-      Cells with value OBSTACLE_MIN..100 are treated as obstacle.
-      Keep OBSTACLE_MIN = FREE_MAX + 1 so there is no gap.
-      The band 31–59 is "uncertain" — treated conservatively as obstacle.
-      SYMPTOM too low: robot steers far around slightly uncertain cells;
-        may not find paths through narrow corridors.
-      SYMPTOM too high: robot attempts to pass through uncertain cells
-        and hits walls.
+── RRT constructor parameters (unchanged) ───────────────────────────
+  step_size, max_iterations, frontier_cluster_radius, robot_radius_cells,
+  sampling_padding_cells, completion_rounds, min_plan_interval,
+  min_known_cells, blacklist_radius  — see inline docs below.
 
-── MAP parameters ────────────────────────────────────────────────────
-  These are now READ from the incoming OccupancyGrid message header
-  (resolution, origin, width, height) so you do NOT need to set them
-  manually.  They update automatically when the first map arrives.
-
-── Constructor parameters ───────────────────────────────────────────
-  step_size  (default 0.35 m)
-      RRT branch length per iteration.
-      SYMPTOM too large: skips over narrow passages; paths clip corners.
-      SYMPTOM too small: tree grows slowly; needs more iterations to
-        reach far frontiers.
-      GOOD RANGE: 0.20–0.50 m.
-
-  max_iterations  (default 600)
-      Random samples per planning tick.
-      SYMPTOM too low: few frontier candidates; robot keeps revisiting
-        the same small area.
-      SYMPTOM too high: planning tick > 1-2 s; robot pauses visibly.
-      GOOD RANGE: 400–1000.
-
-  frontier_cluster_radius  (default 0.6 m)
-      Candidates within this radius of each other form a cluster.
-      Higher cluster count → higher score → robot heads to large
-      unexplored regions rather than thin slivers.
-      SYMPTOM too small: jittery, isolated frontier selection.
-      SYMPTOM too large: distant clusters score too high; robot skips
-        nearby unexplored areas.
-
-  robot_radius_cells  (default 6 cells = 30 cm at 5 cm/cell)
-      Obstacle inflation radius in grid cells.  Set to at least
-      ceil(robot_half_width / map_resolution) + 1.
-      SYMPTOM too small: planned paths pass too close to walls;
-        path follower clips obstacles.
-      SYMPTOM too large: corridors are fully blocked by inflation;
-        exploration declares done prematurely.
-
-  sampling_padding_cells  (default 30 cells = 1.5 m)
-      Extra cells added around the known-map bounding box when drawing
-      random samples.  Keeps samples near the frontier without wasting
-      iterations on the far ends of the grid.
-      SYMPTOM too small: tree never samples just outside the known area;
-        misses adjacent frontiers.
-      SYMPTOM too large: samples spread too wide; most iterations wasted.
-
-  completion_rounds  (default 3)
-      Consecutive ticks with zero valid frontiers before declaring done.
-      SYMPTOM too low: one noisy tick triggers premature return-home.
-      SYMPTOM too high: robot idles after genuine completion.
-
-  min_plan_interval  (default 1.5 s)
-      Minimum seconds between planning ticks.
-      SYMPTOM too low: CPU saturated; SLAM map callbacks starved.
-      SYMPTOM too high: robot sits idle between short paths.
-
-  min_known_cells  (default 200)
-      Minimum number of non-unknown cells in the SLAM map before the
-      RRT will attempt its first plan.  Replaces map_build_delay.
-      SYMPTOM too low: first plan runs into an almost-empty map.
-      SYMPTOM too high: robot waits too long at the start.
-
-  blacklist_radius  (default 0.5 m)
-      Goals that caused a stuck_timeout are blacklisted.  Future runs
-      skip frontier candidates within this radius of any blacklisted point.
-      SYMPTOM too small: robot re-plans to the same stuck spot repeatedly.
-      SYMPTOM too large: large areas near tricky obstacles are permanently
-        avoided; exploration is incomplete.
+── Path-following constants (new — top of file) ─────────────────────
+  KP_LINEAR / KD_LINEAR  forward PID gains
+  KP_ANGULAR             heading correction gain
+  MAX_LINEAR / MAX_ANGULAR  velocity caps
+  WAYPOINT_TOLERANCE / FINAL_WAYPOINT_TOLERANCE  acceptance radii
+  HEADING_GATE_RAD / HEADING_SCALE_MIN  rotate-before-drive gate
+  STUCK_TIMEOUT / STUCK_DIST_THRESHOLD  stuck detection
+  EMERGENCY_FRONT_DIST / EMERGENCY_TURN_SPEED  emergency tier
+  LIDAR_OFFSET_DEG       LiDAR mount rotation (180° here)
+  CONTROL_HZ             follow loop rate
 """
 
 import math
@@ -117,7 +75,7 @@ import random
 import time as _time
 import threading
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List
 import json
 
 import numpy as np
@@ -125,16 +83,51 @@ from scipy.ndimage import binary_dilation
 
 from rclpy.node import Node
 from nav_msgs.msg import Path, OccupancyGrid
-from geometry_msgs.msg import PoseStamped
+from geometry_msgs.msg import PoseStamped, Twist
 
 
 # ======================================================================= #
-#  Cell classification thresholds
-#  Tune these if the robot treats too many cells as obstacles or free.
+#  Cell classification thresholds  (RRT planner)
 # ======================================================================= #
 FREE_MAX     = 30    # 0  .. FREE_MAX       → free
 OBSTACLE_MIN = 31    # OBSTACLE_MIN .. 100  → obstacle  (incl. uncertain 31-59)
 UNKNOWN_VAL  = -1    # exactly -1           → frontier
+
+
+# ======================================================================= #
+#  Path-following constants  (integrated follower)
+# ======================================================================= #
+
+# ── Forward / angular PID ─────────────────────────────────────────────
+KP_LINEAR   = 0.50   # proportional gain on distance to waypoint
+KI_LINEAR   = 0.00   # integral gain (keep 0 unless persistent drift)
+KD_LINEAR   = 0.03   # derivative gain — damps overshoot on approach
+KP_ANGULAR  = 1.00   # proportional gain on heading error (rad → rad/s)
+
+# ── Velocity limits ───────────────────────────────────────────────────
+MAX_LINEAR  = 0.22   # m/s   — forward speed cap
+MAX_ANGULAR = 0.80   # rad/s — angular speed cap
+
+# ── Waypoint advancement ──────────────────────────────────────────────
+WAYPOINT_TOLERANCE       = 0.30  # m — intermediate waypoint acceptance radius
+FINAL_WAYPOINT_TOLERANCE = 0.20  # m — tighter for the last waypoint
+
+# ── Heading gate (rotate before driving) ──────────────────────────────
+HEADING_GATE_RAD  = 0.35   # rad (~20°)
+HEADING_SCALE_MIN = 0.10   # vx scale floor during rotation
+
+# ── Stuck detection ───────────────────────────────────────────────────
+STUCK_TIMEOUT        = 10.0  # s
+STUCK_DIST_THRESHOLD = 0.10  # m — minimum displacement per window
+
+# ── EMERGENCY obstacle tier (only tier kept) ──────────────────────────
+EMERGENCY_FRONT_DIST = 0.15  # m   — full stop + spin below this
+EMERGENCY_TURN_SPEED = 0.40  # rad/s — spin speed in EMERGENCY
+
+LIDAR_OFFSET_DEG = 180       # LiDAR mounted backwards (same as SafeLidarMotion)
+
+# ── Control loop rate ─────────────────────────────────────────────────
+CONTROL_HZ = 20.0
 
 
 # ======================================================================= #
@@ -148,18 +141,31 @@ class TreeNode:
 
 
 # ======================================================================= #
-#  RRTExplorer
+#  RRTExplorer  (planner + follower)
 # ======================================================================= #
 
 class RRTExplorer(Node):
     """
-    Autonomous frontier explorer using the EKF-SLAM OccupancyGrid
-    (/slam_map) for obstacle checking and frontier detection.
+    Autonomous frontier explorer that BOTH plans (RRT over /slam_map)
+    and follows the resulting path itself.
+
+    Wiring in main.py
+    -----------------
+        rrt = RRTExplorer(
+            slam=slam, lidar=lidar, preprocessor=preprocessor, ...
+        )
+        # No PathFollower node needed. No notify_path_done wiring needed.
+
+    Required new constructor args vs the old planner-only version:
+        lidar         — LidarSensor (for EMERGENCY avoidance during follow)
+        preprocessor  — ScanPreprocessor (sector queries)
     """
 
     def __init__(
         self,
         slam,
+        lidar,
+        preprocessor,
         step_size:               float = 0.35,
         max_iterations:          int   = 600,
         frontier_cluster_radius: float = 0.6,
@@ -173,7 +179,9 @@ class RRTExplorer(Node):
     ):
         super().__init__("rrt_explorer")
 
-        self.slam = slam
+        self.slam   = slam
+        self._lidar = lidar
+        self._prep  = preprocessor
 
         self.step_size               = step_size
         self.max_iterations          = max_iterations
@@ -215,6 +223,19 @@ class RRTExplorer(Node):
 
         self._start_pose: Optional[Tuple[float, float]] = None
 
+        # ── FOLLOWER state (new) ─────────────────────────────────────
+        self._follow_path:   List[Tuple[float, float]] = []
+        self._follow_index:  int   = 0
+        self._follow_lock    = threading.Lock()
+
+        self._err_fwd_prev   = 0.0
+        self._err_fwd_integ  = 0.0
+        self._last_ctrl_t    = _time.monotonic()
+
+        self._stuck_ref_pos:  Optional[Tuple[float, float]] = None
+        self._stuck_ref_time: float = _time.monotonic()
+        self._last_turn_dir  = 1
+
         # ── ROS interfaces ───────────────────────────────────────────
         self._map_sub = self.create_subscription(
             OccupancyGrid,
@@ -223,17 +244,25 @@ class RRTExplorer(Node):
             1,
         )
         self.path_pub = self.create_publisher(Path, "/exploration_path", 10)
+        self._cmd_pub = self.create_publisher(Twist, "/cmd_vel", 10)
 
+        # Kept for API compatibility; no longer required for operation.
         self.path_follower = None
 
+        # Planning timer (slow) and following timer (fast)
         self.create_timer(0.5, self._tick)
+        self.create_timer(1.0 / CONTROL_HZ, self._control_loop)
+
         self.get_logger().info(
-            f"[RRT INIT] RRT Explorer (SLAM map) ready — "
+            f"[RRT INIT] RRT Explorer + integrated follower ready — "
             f"map topic: {slam_map_topic}, "
             f"FREE_MAX={FREE_MAX} OBSTACLE_MIN={OBSTACLE_MIN}, "
             f"step_size={step_size} max_iter={max_iterations} "
             f"robot_radius_cells={robot_radius_cells}, "
-            f"blacklist_radius={blacklist_radius:.2f} m"
+            f"blacklist_radius={blacklist_radius:.2f} m | "
+            f"follow: KP_lin={KP_LINEAR} KP_ang={KP_ANGULAR} "
+            f"max_lin={MAX_LINEAR} max_ang={MAX_ANGULAR} "
+            f"emergency_front={EMERGENCY_FRONT_DIST}m"
         )
 
     # ================================================================== #
@@ -242,30 +271,21 @@ class RRTExplorer(Node):
 
     def destroy_node(self):
         self._destroyed = True
+        # Stop the robot on shutdown
+        try:
+            self._cmd_pub.publish(Twist())
+        except Exception:
+            pass
         super().destroy_node()
 
     def notify_path_done(self, reason: str = "completed"):
         """
-        Called by PathFollower when the current path ends.
-
-        reason:
-          "completed"     — robot reached the final waypoint normally.
-          "stuck_timeout" — robot did not make progress; goal unreachable.
+        Retained for API compatibility (e.g. ArucoMonitor may call it to
+        abort the current path).  Internally the follower calls
+        _on_path_done() directly, but routing through here keeps the old
+        contract working for any external caller.
         """
-        self.get_logger().info(
-            f"[RRT PATH_DONE] notify_path_done(reason='{reason}') — "
-            f"last goal was {self._current_goal}"
-        )
-
-        if reason == "stuck_timeout" and self._current_goal is not None:
-            bx, by = self._current_goal
-            self._blacklisted_frontiers.append((bx, by))
-            self.get_logger().warn(
-                f"[RRT BLACKLIST] Blacklisting frontier ({bx:.2f}, {by:.2f}) — "
-                f"total blacklisted: {len(self._blacklisted_frontiers)}"
-            )
-
-        self._path_executing = False
+        self._on_path_done(reason)
 
     # ================================================================== #
     #  SLAM map callback
@@ -902,7 +922,7 @@ class RRTExplorer(Node):
             self.get_logger().warn(f"[RRT] _save_debug failed: {e}")
 
     # ================================================================== #
-    #  TICK  (every 0.5 s)
+    #  TICK  (every 0.5 s)  — PLANNING
     # ================================================================== #
 
     def _tick(self):
@@ -911,12 +931,11 @@ class RRTExplorer(Node):
         if self._destroyed:
             return
 
-        # ── BUG DETECTOR: path still executing ───────────────────────
+        # ── Path still executing → planning paused, follower is driving ─
         if self._path_executing:
             self.get_logger().info(
-                f"[RRT TICK #{self._tick_count}] Skipping — path still "
-                f"executing. Waiting for notify_path_done(). "
-                f"If stuck here forever, check path_follower.explorer is set."
+                f"[RRT TICK #{self._tick_count}] Skipping plan — path still "
+                f"executing (follower active). Will plan again when path done."
             )
             return
 
@@ -976,13 +995,7 @@ class RRTExplorer(Node):
                 )
                 return
 
-            self._current_goal   = goal
-            # ── BUG DETECTOR: notify_path_done wiring ─────────────────
-            # _path_executing stays True until notify_path_done() is called.
-            # If path_follower.explorer is not set in main.py, this flag
-            # never clears and the robot stops planning permanently after
-            # the first path.
-            self._path_executing = True
+            self._current_goal = goal
 
             # Record real start pose on first successful plan
             if self._start_pose is None and not self._returning_home:
@@ -996,6 +1009,7 @@ class RRTExplorer(Node):
                 )
                 self._start_pose = (float(rx), float(ry))
 
+            # ── Publish path to /exploration_path (for RViz) ──────────
             path_msg                 = Path()
             path_msg.header.stamp    = self.get_clock().now().to_msg()
             path_msg.header.frame_id = "map"
@@ -1008,17 +1022,18 @@ class RRTExplorer(Node):
                 path_msg.poses.append(p)
 
             if self._destroyed:
-                self._path_executing = False
                 return
 
             self.path_pub.publish(path_msg)
 
+            # ── Hand the path to the INTERNAL follower ────────────────
+            self._start_following(path)
+
             phase = "RETURN HOME" if self._returning_home else "EXPLORE"
             self.get_logger().info(
-                f"[RRT TICK #{self._tick_count}] [{phase}] Published path: "
+                f"[RRT TICK #{self._tick_count}] [{phase}] Published + following path: "
                 f"{len(path)} waypoints → goal ({goal[0]:.2f}, {goal[1]:.2f}). "
-                f"_path_executing=True — will not replan until "
-                f"notify_path_done() is called by PathFollower."
+                f"_path_executing=True — planning paused until follow completes."
             )
             self._save_debug(path, goal)
 
@@ -1027,3 +1042,265 @@ class RRTExplorer(Node):
             self.get_logger().error(
                 f"[BUG] _tick #{self._tick_count} crashed:\n" + traceback.format_exc()
             )
+
+    # ================================================================== #
+    #  INTEGRATED PATH FOLLOWER
+    # ================================================================== #
+
+    def _start_following(self, path: List[Tuple[float, float]]):
+        rx, ry, _ = self.slam.pose
+        # Prepend the robot's CURRENT position so the path starts where the
+        # robot actually is, not where the tree root was at plan time.
+        full_path = [(float(rx), float(ry))] + [(float(x), float(y)) for x, y in path]
+        with self._follow_lock:
+            self._follow_path  = full_path
+            self._follow_index = 0
+        self._reset_follow_pid()
+        self._reset_stuck_detector()
+        self._path_executing = True
+
+    def _on_path_done(self, reason: str):
+        """
+        Called by the follower when the path ends.
+
+        reason:
+          "completed"     — robot reached the final waypoint.
+          "stuck_timeout" — no progress; blacklist the goal.
+
+        Clears _path_executing so the next _tick() can plan a new path.
+        This replaces the old cross-node notify_path_done() contract.
+        """
+        self.get_logger().info(
+            f"[RRT PATH_DONE] _on_path_done(reason='{reason}') — "
+            f"last goal was {self._current_goal}"
+        )
+
+        if reason == "stuck_timeout" and self._current_goal is not None:
+            bx, by = self._current_goal
+            self._blacklisted_frontiers.append((bx, by))
+            self.get_logger().warn(
+                f"[RRT BLACKLIST] Blacklisting frontier ({bx:.2f}, {by:.2f}) — "
+                f"total blacklisted: {len(self._blacklisted_frontiers)}"
+            )
+
+        # Clear path + stop robot
+        with self._follow_lock:
+            self._follow_path  = []
+            self._follow_index = 0
+        self._cmd_pub.publish(Twist())
+
+        # Re-arm planning
+        self._path_executing = False
+
+    def _control_loop(self):
+        """Fast (20 Hz) follow loop. Active only while _path_executing."""
+        if self._destroyed:
+            return
+        if not self._path_executing:
+            return
+
+        with self._follow_lock:
+            if not self._follow_path:
+                return
+            path     = list(self._follow_path)
+            wp_index = self._follow_index
+
+        # ── 1. Robot pose from SLAM ───────────────────────────────
+        pose = self.slam.pose   # (x, y, theta)
+        rx, ry, rtheta = float(pose[0]), float(pose[1]), float(pose[2])
+
+        # ── 2. Guard against exhausted waypoint list ──────────────
+        if wp_index >= len(path):
+            self._on_path_done("completed")
+            return
+
+        is_final  = (wp_index == len(path) - 1)
+        tolerance = FINAL_WAYPOINT_TOLERANCE if is_final else WAYPOINT_TOLERANCE
+        tx, ty    = path[wp_index]
+
+        dx_world = tx - rx
+        dy_world = ty - ry
+        dist     = math.hypot(dx_world, dy_world)
+
+        # ── 3. Advance waypoint when close enough ─────────────────
+        if dist < tolerance:
+            self.get_logger().info(
+                f"[FOLLOW] WP {wp_index}/{len(path)-1} reached "
+                f"(dist={dist:.3f} m). "
+                + ("Path complete!" if is_final else "Next WP.")
+            )
+            if is_final:
+                self._on_path_done("completed")
+                return
+            with self._follow_lock:
+                self._follow_index += 1
+                wp_index = self._follow_index
+            # Do NOT reset PID between waypoints (avoids derivative spike)
+            if wp_index < len(path):
+                tx, ty   = path[wp_index]
+                dx_world = tx - rx
+                dy_world = ty - ry
+                dist     = math.hypot(dx_world, dy_world)
+                is_final = (wp_index == len(path) - 1)
+            else:
+                self._on_path_done("completed")
+                return
+
+        # ── 4. Stuck detection ────────────────────────────────────
+        if self._check_stuck(rx, ry):
+            self.get_logger().warn(
+                f"[FOLLOW] STUCK at ({rx:.2f},{ry:.2f}) "
+                f"after {STUCK_TIMEOUT:.0f}s — blacklisting goal."
+            )
+            self._on_path_done("stuck_timeout")
+            return
+
+        # ── 5. Heading error ──────────────────────────────────────
+        desired_heading = math.atan2(dy_world, dx_world)
+        heading_err     = _wrap_angle(desired_heading - rtheta)
+
+        # ── 6. Skip waypoints directly behind the robot ───────────
+        #cos_t        = math.cos(rtheta)
+        #sin_t        = math.sin(rtheta)
+        # err_fwd_proj = cos_t * dx_world + sin_t * dy_world
+
+        # if err_fwd_proj < 0.05 and not is_final:
+        #     self.get_logger().info(
+        #         f"[FOLLOW] WP {wp_index} behind robot "
+        #         f"(proj={err_fwd_proj:.2f}m) — skipping."
+        #     )
+        #     with self._follow_lock:
+        #         self._follow_index += 1
+        #     return
+
+        # ── 7. Forward error = full Euclidean distance ────────────
+        err_fwd = dist
+
+        # ── 8. Forward PID ────────────────────────────────────────
+        now = _time.monotonic()
+        dt  = now - self._last_ctrl_t
+        dt  = dt if 0.0 < dt <= 1.0 else 1.0 / CONTROL_HZ
+        self._last_ctrl_t = now
+
+        vx_raw = KP_LINEAR * err_fwd
+        self._err_fwd_integ += err_fwd * dt
+        vx_raw += KI_LINEAR * self._err_fwd_integ
+        vx_raw += KD_LINEAR * (err_fwd - self._err_fwd_prev) / dt
+        self._err_fwd_prev = err_fwd
+
+        # ── 9. Heading gate ───────────────────────────────────────
+        heading_abs = abs(heading_err)
+        if heading_abs > HEADING_GATE_RAD:
+            t = min((heading_abs - HEADING_GATE_RAD) / HEADING_GATE_RAD, 1.0)
+            linear_scale = max(HEADING_SCALE_MIN, 1.0 - t)
+        else:
+            linear_scale = 1.0
+
+        vx_cmd = _clamp(vx_raw * linear_scale, 0.0, MAX_LINEAR)
+
+        # ── 10. Angular command ───────────────────────────────────
+        wz_cmd = _clamp(KP_ANGULAR * heading_err, -MAX_ANGULAR, MAX_ANGULAR)
+
+        # ── 11. EMERGENCY obstacle override (only tier kept) ──────
+        vx_cmd, wz_cmd = self._apply_emergency(vx_cmd, wz_cmd)
+
+        # ── 12. Publish (vy always 0) ─────────────────────────────
+        twist           = Twist()
+        twist.linear.x  = float(vx_cmd)
+        twist.linear.y  = 0.0
+        twist.angular.z = float(wz_cmd)
+        self._cmd_pub.publish(twist)
+
+        self.get_logger().info(
+            f"[FOLLOW] WP {wp_index}/{len(path)-1} dist={dist:.2f}m | "
+            f"h_err={math.degrees(heading_err):+.1f}° scale={linear_scale:.2f} | "
+            f"vx={vx_cmd:+.3f} vy=0.000 wz={wz_cmd:+.3f}"
+        )
+
+    # ── EMERGENCY-only avoidance ──────────────────────────────────────
+
+    def _apply_emergency(self, vx: float, wz: float) -> Tuple[float, float]:
+        """
+        Single-tier obstacle safety: if the front sector is closer than
+        EMERGENCY_FRONT_DIST, stop translating and spin toward the more
+        open side.  Otherwise pass the path-following commands through.
+
+        SLOW and NORMAL nudge tiers are intentionally omitted — the RRT
+        path is already collision-checked, so during normal following we
+        trust the path and only guard against imminent collision.
+        """
+        scan = self._lidar.get_scan()
+        if scan is None:
+            self.get_logger().warn(
+                "[FOLLOW/Emergency] No LiDAR scan — commands unchanged.",
+                throttle_duration_sec=2.0,
+            )
+            return vx, wz
+
+        processed = self._prep.preprocess(scan)
+        front     = self._sector_min(processed, -20, 20)
+
+        if front < EMERGENCY_FRONT_DIST:
+            left  = self._sector_min(processed,  20,  70)
+            right = self._sector_min(processed, -70, -20)
+            if left >= right:
+                turn = +EMERGENCY_TURN_SPEED
+                self._last_turn_dir = +1
+            else:
+                turn = -EMERGENCY_TURN_SPEED
+                self._last_turn_dir = -1
+
+            self.get_logger().warn(
+                f"[FOLLOW/Emergency] front={front:.2f}m < {EMERGENCY_FRONT_DIST:.2f}m — "
+                f"HALT + spin {'LEFT' if turn > 0 else 'RIGHT'}."
+            )
+            return 0.0, turn
+
+        return vx, wz
+
+    def _sector_min(self, processed: dict, a_min: float, a_max: float) -> float:
+        """Min range in sector [a_min, a_max] deg, with LiDAR mount offset."""
+        off = LIDAR_OFFSET_DEG
+        return self._prep.get_sector_min(processed, a_min + off, a_max + off)
+
+    # ── Follower PID / stuck helpers ──────────────────────────────────
+
+    def _reset_follow_pid(self):
+        self._err_fwd_prev  = 0.0
+        self._err_fwd_integ = 0.0
+        self._last_ctrl_t   = _time.monotonic()
+
+    def _reset_stuck_detector(self):
+        pose = self.slam.pose
+        self._stuck_ref_pos  = (float(pose[0]), float(pose[1]))
+        self._stuck_ref_time = _time.monotonic()
+
+    def _check_stuck(self, rx: float, ry: float) -> bool:
+        elapsed = _time.monotonic() - self._stuck_ref_time
+        if elapsed < STUCK_TIMEOUT:
+            return False
+        if self._stuck_ref_pos is None:
+            self._reset_stuck_detector()
+            return False
+
+        moved = math.hypot(rx - self._stuck_ref_pos[0],
+                           ry - self._stuck_ref_pos[1])
+        if moved < STUCK_DIST_THRESHOLD:
+            return True
+
+        self._stuck_ref_pos  = (rx, ry)
+        self._stuck_ref_time = _time.monotonic()
+        return False
+
+
+# ======================================================================= #
+#  Utility functions
+# ======================================================================= #
+
+def _wrap_angle(a: float) -> float:
+    """Wrap angle to (-π, π]."""
+    return math.atan2(math.sin(a), math.cos(a))
+
+
+def _clamp(v: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, v))
