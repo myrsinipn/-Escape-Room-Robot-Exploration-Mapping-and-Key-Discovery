@@ -29,7 +29,7 @@ K_V           = 0.80
 K_YAW         = 0.40
 MAX_WZ        = 0.40
 CLOSE_WZ      = 0.50
-WP_TOL        = 0.10   # waypoint reached tolerance (m) — exact small-file value
+WP_TOL        = 0.30   # waypoint reached tolerance (m) — exact small-file value
 STRAY_DIST    = 0.9    # m; if robot strays farther than this from its target
                        # waypoint, the committed path is stale (SLAM jumped) and
                        # is abandoned so the next tick replans from current pose
@@ -476,7 +476,7 @@ class RRTExplorer(Node):
             n = max(1, int(math.hypot(x1 - x0, y1 - y0) / (res * 0.5)))
             for k in range(n + 1):
                 t = k / n
-                if self._cell_occ_latest(x0 + t * (x1 - x0), y0 + t * (y1 - y0)) >= 50:
+                if self._cell_occ_latest(x0 + t * (x1 - x0), y0 + t * (y1 - y0)) >= 30:
                     return True
         return False
 
@@ -548,59 +548,40 @@ class RRTExplorer(Node):
         # node by node. No lookahead / no shortcutting, so the robot tracks the
         # planned path itself instead of cutting across it.
         with self._follow_lock:
-            while self._follow_index < len(self._follow_path):
-                tx, ty = self._follow_path[self._follow_index]
-                if math.hypot(tx - rx, ty - ry) < WP_TOL:
-                    self._follow_index += 1
-                else:
-                    break
-            if self._follow_index >= len(self._follow_path):
-                done, target = True, None
-            else:
-                done, target = False, self._follow_path[self._follow_index]
-
-        if done:
-            self.get_logger().info("[FOLLOW] reached goal.")
-            self._on_path_done("completed")
-            return
+            # Move index forward if we are close to current waypoint
+            while self._follow_index < len(self._follow_path) - 1 and \
+                  math.hypot(self._follow_path[self._follow_index][0] - rx, 
+                             self._follow_path[self._follow_index][1] - ry) < 0.2:
+                self._follow_index += 1
+            
+            target = self._follow_path[self._follow_index]
 
         tx, ty = target
-        ex, ey = tx - rx, ty - ry
-        dist = math.hypot(ex, ey)
+        dist = math.hypot(tx - rx, ty - ry)
+        
+        # Calculate heading error to the target
+        target_yaw = math.atan2(ty - ry, tx - rx)
+        yaw_err = _wrap_angle(target_yaw - rth)
 
-        # Re-anchor guard: a healthy path starts at the robot, so the target is
-        # always within ~step_size. If it's much farther, the SLAM pose jumped
-        # and this path is stale — abandon it and replan from the current pose.
-        if dist > STRAY_DIST:
-            self.get_logger().warn(
-                "[FOLLOW] robot far from path (SLAM jump?); replanning.",
-                throttle_duration_sec=2.0)
-            self._on_path_done("replan")
-            return
-
-        yaw_err = _wrap_angle(math.atan2(ey, ex) - rth)
-
-        if self._turning:
-            if abs(yaw_err) < ALIGN_THRESH:
-                self._turning = False
-        elif abs(yaw_err) > TURN_THRESH:
-            self._turning = True
-
+        # 3. NO SPIN-IN-PLACE: Always drive forward, just steer harder if error is high
         cmd = Twist()
-        if self._turning:
-            wz = _clamp(K_YAW * yaw_err, -MAX_WZ, MAX_WZ)
-            if self._front_blocked():
-                wz = _clamp(wz, -CLOSE_WZ, CLOSE_WZ)
-            cmd.angular.z = float(wz)
-        else:
-            if self._front_blocked():
-                self.get_logger().warn("[FOLLOW] obstacle ahead; backing up.",
-                                       throttle_duration_sec=2.0)
-                self._start_backup()
-                return
-            cmd.linear.x = float(min(MAX_SPEED, K_V * dist))
+        
+        if self._front_blocked():
+            self._start_backup()
+            return
+        
+        # Proportional Steering:
+        # We always drive forward at a speed scaled by how much we need to turn.
+        # If yaw_err is large, we drive slower and turn faster.
+        # If yaw_err is small, we drive at full speed.
+        
+        steering = K_YAW * yaw_err
+        speed = MAX_SPEED * (1.0 - abs(yaw_err) / 2.0) # Slow down in sharp turns
+        
+        cmd.linear.x = float(max(0.02, speed)) # Always move forward
+        cmd.angular.z = float(_clamp(steering, -MAX_WZ, MAX_WZ))
+        
         self._cmd_pub.publish(cmd)
-
     def _start_backup(self):
         self._cmd_pub.publish(Twist())
         if self._current_goal is not None:

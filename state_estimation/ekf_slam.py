@@ -122,6 +122,11 @@ class EKFLidarSLAM(Node):
         # ── Timing ───────────────────────────────────────────────────
         self.prev_odom_timestamp = None
 
+        # Latest processed scan, stashed by correction_step and consumed by the
+        # map timer so the heavy raycasting runs OFF the EKF correction/pose path.
+        self._latest_ranges = None
+        self._latest_angles = None
+
         # ── Publishers ───────────────────────────────────────────────
         self.pose_pub     = self.create_publisher(
             PoseWithCovarianceStamped, "/slam_pose", 10)
@@ -269,11 +274,14 @@ class EKFLidarSLAM(Node):
             for obs in observations:
                 self.process_observation(obs)
 
-            self.update_occupancy_grid(ranges, angles)
-            self.get_logger().info("DEBUG: Raycasting grid update finished successfully!")  
+            # Stash the latest scan; raycasting now runs in publish_map_step so
+            # the heavy occupancy-grid update no longer blocks the EKF
+            # correction / prediction (pose) loop.
+            self._latest_ranges = ranges
+            self._latest_angles = angles
             self.publish_landmarks()
-            # Map is now published by a dedicated timer (publish_map_step)
-            # so this loop never blocks waiting for a slow serialisation.
+            # Map raycasting + publishing now happen on the dedicated map timer
+            # (publish_map_step) so this loop never blocks on the grid update.
         except Exception:
             self.get_logger().error(
                 "correction crashed:\n" + traceback.format_exc()
@@ -393,8 +401,13 @@ class EKFLidarSLAM(Node):
 
     def ekf_correct(self, H, innovation, S) -> None:
         kalman_gain = self.Sigma @ H.T @ np.linalg.inv(S)
+        correction = kalman_gain @ innovation
+        if np.linalg.norm(correction[:2]) > 0.5:
+            self.get_logger().warn("Discarding massive SLAM correction!")
+            return
         pose_before = self.mu[:3, 0].copy()
-        self.mu = self.mu + kalman_gain @ innovation
+
+        self.mu = self.mu + correction
         self.mu[2, 0] = wrap_angle(self.mu[2, 0])
         state_size = self.mu.shape[0]
         self.Sigma = (np.eye(state_size) - kalman_gain @ H) @ self.Sigma
@@ -634,8 +647,16 @@ class EKFLidarSLAM(Node):
             pass
 
     def publish_map_step(self) -> None:
-        """Timer callback at 2 Hz — publishes the occupancy grid."""
+        """Timer callback — raycast the latest scan, then publish the grid.
+
+        Raycasting was moved here (off the 5 Hz correction path) so the heavy,
+        GIL-holding grid update runs at this slower map rate instead of starving
+        the prediction/pose loop.
+        """
         try:
+            if self._latest_ranges is not None:
+                self.update_occupancy_grid(self._latest_ranges, self._latest_angles)
+                self.get_logger().info("DEBUG: Raycasting grid update finished successfully!")
             self.publish_map()
         except Exception:
             self.get_logger().error(

@@ -58,6 +58,20 @@ while True:
                 label=f"Goal ({goal['x']:.2f}, {goal['y']:.2f})",
             )
 
+        # ── Draw Blacklisted Frontiers ───────────────────────────────
+        blacklisted = data.get("blacklisted", [])
+        if len(blacklisted) > 0:
+            bx = [b["x"] for b in blacklisted]
+            by = [b["y"] for b in blacklisted]
+            ax.scatter(
+                bx, by,
+                s=100,
+                color="black",
+                marker="X",
+                zorder=4,
+                label=f"Blacklisted ({len(blacklisted)})"
+            )
+
         # ── Draw target (optional) ───────────────────────────────────
         target = data.get("target")
         if target:
@@ -151,7 +165,7 @@ while True:
         # ── Stats overlay ────────────────────────────────────────────
         tree_size   = len(data.get("tree", []))
         path_len    = len(path)
-        stats_text  = f"Tree edges: {tree_size}  |  Path pts: {path_len}  |  Map Features: {len(landmarks)}"
+        stats_text  = f"Tree edges: {tree_size}  |  Path pts: {path_len}  |  Map Features: {len(landmarks)}  |  Blacklisted: {len(blacklisted)}"
         ax.set_title(stats_text, fontsize=10)
 
         ax.set_xlabel("X (m)")
