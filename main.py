@@ -72,25 +72,13 @@ def main() -> None:
         motion_model=motion_model,
     )
 
-    # path_follower = PathFollower(
-    #     slam,
-    #     lidar=lidar,
-    #     preprocessor=preprocessor
-    # )
-
-    rrt = RRTExplorer(
-        slam=slam,
-        lidar=lidar,                    # NEW
-        preprocessor=preprocessor,      # NEW
-        step_size=0.35,
-        max_iterations=1200,
-        frontier_cluster_radius=0.6,
-        robot_radius_cells=3,
-        sampling_padding_cells=15,
-        slam_map_topic="/slam_map",
-        min_known_cells=800,
-        min_plan_interval=2.0,
-    )
+    # ── Explorer ──────────────────────────────────────────────────────
+    # New RRTExplorer is a self-contained node (like the two working files):
+    # it reads the map off a topic, the pose off TF (map -> base_footprint),
+    # and /scan, then publishes /cmd_vel. It no longer takes slam/lidar/
+    # preprocessor objects. Only the SLAM map topic name needs to match what
+    # EKFLidarSLAM actually publishes.
+    rrt = RRTExplorer(map_topic="/slam_map")
 
     aruco_monitor = ArucoMonitor(
         camera=camera,
@@ -99,11 +87,8 @@ def main() -> None:
         explorer=rrt
     )
 
-    # ── Wire explorer ↔ follower ─────────────────────
-
-    #rrt.path_follower = path_follower
-    #path_follower.explorer = rrt
-    rrt._cmd_pub.publish(Twist())
+    # stop motors at startup (publisher is named cmd_pub on the new node)
+    rrt.cmd_pub.publish(Twist())
 
     # ── Executor ──────────────────────────────────────────────────────
     executor = MultiThreadedExecutor()
@@ -123,7 +108,7 @@ def main() -> None:
     finally:
         aruco_monitor.print_summary()
         slam.print_debug_summary()
-        # path_follower._cmd_pub.publish(Twist())   # stop motors  ← underscore
+        rrt.cmd_pub.publish(Twist())   # stop motors
 
         for node in [
             rrt,

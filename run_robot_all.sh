@@ -3,7 +3,7 @@
 SESSION="robot_ros"
 MYAGV_WS="/home/er/myagv_ros"
 BRIDGE_YAML="/home/er/B07/-Escape-Room-Robot-Exploration-Mapping-and-Key-Discovery/bridge.yaml"
-DOMAIN_ID=10
+DOMAIN_ID=7
 
 # We must source ROS 1 in the main script so it can check if the nodes are done booting
 source /opt/ros/noetic/setup.bash
