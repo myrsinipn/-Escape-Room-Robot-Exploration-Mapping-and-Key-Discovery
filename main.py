@@ -82,7 +82,7 @@ def main() -> None:
         slam=slam,
         lidar=lidar,                    # NEW
         preprocessor=preprocessor,      # NEW
-        step_size=0.15,
+        step_size=0.35,
         max_iterations=1200,
         frontier_cluster_radius=0.6,
         robot_radius_cells=3,
@@ -123,11 +123,10 @@ def main() -> None:
     finally:
         aruco_monitor.print_summary()
         slam.print_debug_summary()
-        path_follower._cmd_pub.publish(Twist())   # stop motors  ← underscore
+        # path_follower._cmd_pub.publish(Twist())   # stop motors  ← underscore
 
         for node in [
             rrt,
-            path_follower,
             slam,
             aruco_monitor,
             odom,
