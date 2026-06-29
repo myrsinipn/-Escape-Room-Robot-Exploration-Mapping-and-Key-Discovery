@@ -51,12 +51,17 @@ class KeyDoorRegistry:
     def register_key_detection(
         self,
         key_id: int,
-    ) -> None:
+    ) -> bool:
         """
         Mark a key as discovered.
         """
 
+        if key_id not in self.key_to_door_map:
+            return False
+
+        is_new = key_id not in self.discovered_keys
         self.discovered_keys.add(key_id)
+        return is_new
 
     def has_key(
         self,

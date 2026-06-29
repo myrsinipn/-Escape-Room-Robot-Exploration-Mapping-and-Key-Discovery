@@ -20,7 +20,7 @@ from rclpy.node import Node
 from rclpy.callback_groups import ReentrantCallbackGroup
 
 from nav_msgs.msg import OccupancyGrid
-from geometry_msgs.msg import PoseWithCovarianceStamped, Twist
+from geometry_msgs.msg import PoseWithCovarianceStamped
 from visualization_msgs.msg import Marker, MarkerArray
 
 from sensors.lidar import LidarSensor
@@ -124,20 +124,16 @@ class EKFLidarSLAM(Node):
         self.max_mapping_range = 4.0
 
         # ── Rotation Freezing Logic ──────────────────────────────────
+        # Detected from odometry (not cmd_vel) to avoid the 100ms bridge lag.
         self._rotating = False
-        self._rotate_wz_thresh = 0.08   # rad/s — above this -> spinning
-        self._rotate_vx_thresh = 0.04   # m/s  — below this -> pivoting in place
+        self._rotate_wz_thresh = 0.18   # rad/s — set above drive_wz_cap (0.12) so SLAM only pauses during true pivot (TURN phase)
+        self._rotate_vx_thresh = 0.01   # m/s  — below this counts as stationary (smooth controller keeps vx > 0 even when turning)
 
         # ── Timing ───────────────────────────────────────────────────
         self.prev_odom_timestamp = None
 
         self._latest_ranges: np.ndarray | None = None
         self._latest_angles: np.ndarray | None = None
-
-        # ── Subscribers ──────────────────────────────────────────────
-        self.create_subscription(
-            Twist, "/cmd_vel", self.cmdvel_cb, 10, callback_group=self.callback_group
-        )
 
         # ── Publishers ───────────────────────────────────────────────
         self.pose_pub = self.create_publisher(
@@ -172,16 +168,6 @@ class EKFLidarSLAM(Node):
             f"({self.map_width}x{self.map_height} cells @ {self.map_resolution} m/cell), "
             f"origin ({self.map_origin_x:.1f}, {self.map_origin_y:.1f})"
         )
-
-    def cmdvel_cb(self, msg: Twist) -> None:
-        """Tracks whether the robot is turning sharply in place to freeze map smear."""
-        turning = (abs(msg.angular.z) > self._rotate_wz_thresh and
-                   abs(msg.linear.x) < self._rotate_vx_thresh)
-        if turning != self._rotating:
-            self._rotating = turning
-            self.get_logger().info(
-                f'SLAM Grid Mapping updates: {"PAUSED (spinning in place)" if turning else "ACTIVE"}'
-            )
 
     # ================================================================
     # PREDICTION
@@ -671,7 +657,19 @@ class EKFLidarSLAM(Node):
                 ranges = self._latest_ranges
                 angles = self._latest_angles
 
-            # Rotation safety check active: skip raycasting if spinning in place
+            # Detect spinning in place directly from odometry — no bridge lag.
+            vel_data = self.odom.get_velocity()
+            if vel_data is not None:
+                vx, vy, omega = vel_data["velocity"]
+                speed = math.hypot(float(vx), float(vy))
+                spinning = (abs(float(omega)) > self._rotate_wz_thresh and
+                            speed < self._rotate_vx_thresh)
+                if spinning != self._rotating:
+                    self._rotating = spinning
+                    self.get_logger().info(
+                        f'SLAM Grid Mapping: {"PAUSED (spinning)" if spinning else "ACTIVE"}'
+                    )
+
             if ranges is not None and not self._rotating:
                 self.update_occupancy_grid(ranges, angles)
 

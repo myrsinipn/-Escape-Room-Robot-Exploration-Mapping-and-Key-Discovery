@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-from typing import Dict, Tuple, Optional
+from typing import Dict, Tuple
 import numpy as np
 
 from state_estimation.key_door_registry import KeyDoorRegistry
@@ -33,8 +33,10 @@ class DoorRegistry:
             self.marker_pair_to_door[(a,b)] = door_id
 
         self.marker_world_positions = {}
+        self._marker_observations = {}
 
         self.door_world_positions = {}
+        self.key_world_positions = {}
 
     def register_marker_position(
         self,
@@ -43,10 +45,17 @@ class DoorRegistry:
         wy: float
     ):
 
-        self.marker_world_positions[marker_id] = (
-            wx,
-            wy
+        # Camera pose estimates jitter.  Keep an incremental mean so a door
+        # does not jump around the map (or leave stale blocked-door overlays)
+        # every time another frame is processed.
+        count = self._marker_observations.get(marker_id, 0)
+        old = np.asarray(
+            self.marker_world_positions.get(marker_id, (wx, wy)),
+            dtype=float,
         )
+        new = (old * count + np.asarray((wx, wy), dtype=float)) / (count + 1)
+        self._marker_observations[marker_id] = count + 1
+        self.marker_world_positions[marker_id] = tuple(new)
 
         self._try_build_doors()
 
@@ -70,20 +79,23 @@ class DoorRegistry:
 
             center = (p1+p2)/2
 
+            previous = self.door_world_positions.get(door_id, {})
             self.door_world_positions[door_id] = {
 
                 "left":tuple(p1),
                 "right":tuple(p2),
-                "center":tuple(center)
+                "center":tuple(center),
+                "_blocked": previous.get("_blocked", False),
             }
 
     def register_key(
         self,
-        key_id:int
+        key_id:int,
+        position=None,
     ):
-        self.registry.register_key_detection(
-            key_id
-        )
+        if position is not None:
+            self.key_world_positions[key_id] = tuple(position)
+        return self.registry.register_key_detection(key_id)
 
     def is_door_unlocked(
         self,

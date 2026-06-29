@@ -81,7 +81,10 @@ def main() -> None:
         camera=camera,
         aruco=aruco,
         slam=slam,
-        explorer=rrt
+        explorer=rrt,
+        config_path=os.path.join(
+            os.path.dirname(__file__), "config", "key_doors.json"
+        ),
     )
 
     # stop motors at startup safely using the correct internal publisher name

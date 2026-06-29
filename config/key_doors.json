@@ -1,0 +1,12 @@
+{
+  "door_marker_pairs": [
+    {
+      "door_id": 1,
+      "markers": [5, 6]
+    }
+  ],
+  "key_to_door": {
+    "10": 1
+  },
+  "confirmation_frames": 3
+}
