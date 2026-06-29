@@ -16,7 +16,7 @@ class CameraSensor(Node):
 
     Responsibilities:
     - Subscribe to camera topic
-    - Convert ROS image -> OpenCV image
+    - Convert ROS image to OpenCV image
     - Store latest frame
     - Provide clean API
 
@@ -58,7 +58,7 @@ class CameraSensor(Node):
     def image_callback(self, msg: Image) -> None:
         """
         ROS2 image callback.
-        Converts ROS Image message -> OpenCV frame.
+        Converts ROS Image message to OpenCV frame.
         """
 
         try:
