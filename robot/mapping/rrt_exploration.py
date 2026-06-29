@@ -102,12 +102,13 @@ class RRTExplorer(Node):
         self.yaw_sign       = 1.0       # flip to -1.0 if robot turns the wrong way
 
         # ── LiDAR forward-obstacle detection ─────────────────────────
-        self.safe_dist         = 0.30   # m — stop below this clearance
-        self.forward_sector    = 40.0   # degrees — checked sector (±40° from front)
-        self._obstacle_timeout = 3.0    # s — wait before triggering escape spin
-        self._obstacle_since: Optional[float] = None
-        self._escaping = False
-        self._escape_yaw_target: Optional[float] = None
+        # [PRESENTATION] Motion control commented out — SafeLidarMotion handles driving.
+        # self.safe_dist         = 0.30
+        # self.forward_sector    = 40.0
+        # self._obstacle_timeout = 3.0
+        # self._obstacle_since: Optional[float] = None
+        # self._escaping = False
+        # self._escape_yaw_target: Optional[float] = None
 
         # ── Shared navigation state (guarded by _lock) ────────────────
         self._lock = threading.RLock()
@@ -139,7 +140,8 @@ class RRTExplorer(Node):
 
         # ── Timers ────────────────────────────────────────────────────
         self.create_timer(self.planner_period, self._plan_cb,  callback_group=self.cb_group)
-        self.create_timer(self.control_period, self._ctrl_cb,  callback_group=self.cb_group)
+        # [PRESENTATION] Control timer disabled — SafeLidarMotion drives the robot.
+        # self.create_timer(self.control_period, self._ctrl_cb,  callback_group=self.cb_group)
 
         self.get_logger().info("RRT frontier explorer initialized.")
 
@@ -152,14 +154,16 @@ class RRTExplorer(Node):
             self.plan_if_needed()
         except Exception:
             self.get_logger().error("planner crashed:\n" + traceback.format_exc())
-            self.stop_robot()
+            # [PRESENTATION] stop_robot disabled — SafeLidarMotion handles motion.
+            # self.stop_robot()
 
-    def _ctrl_cb(self) -> None:
-        try:
-            self.follow_path()
-        except Exception:
-            self.get_logger().error("follower crashed:\n" + traceback.format_exc())
-            self.stop_robot()
+    # [PRESENTATION] Control callback disabled — SafeLidarMotion drives the robot.
+    # def _ctrl_cb(self) -> None:
+    #     try:
+    #         self.follow_path()
+    #     except Exception:
+    #         self.get_logger().error("follower crashed:\n" + traceback.format_exc())
+    #         self.stop_robot()
 
     # ====================================================================
     # PLANNER
@@ -333,58 +337,57 @@ class RRTExplorer(Node):
     # ====================================================================
     # FOLLOWER — reactive LiDAR drive
     #
-    # The robot always drives forward.  If an obstacle is detected within
-    # safe_dist, forward motion stops and the robot steers toward the
-    # clearer side (left vs right clearance comparison).
-    # RRT paths are published to RViz only and do NOT control motion.
+    # [PRESENTATION] The entire follower / motion-control section is commented out.
+    # SafeLidarMotion (safe_lidar_motion.py) drives the physical robot instead.
+    # RRT paths are published to RViz only and do NOT control motion here.
     # ====================================================================
 
-    def _forward_clearance(self) -> float:
-        """Return the minimum LiDAR range in the forward sector (±forward_sector deg)."""
-        if self.lidar is None or self.preprocessor is None:
-            return float("inf")
-        raw = self.lidar.get_scan()
-        if raw is None:
-            return float("inf")
-        processed = self.preprocessor.preprocess(raw)
-        return self.preprocessor.get_sector_min(
-            processed, -self.forward_sector, self.forward_sector
-        )
+    # def _forward_clearance(self) -> float:
+    #     """Return the minimum LiDAR range in the forward sector (±forward_sector deg)."""
+    #     if self.lidar is None or self.preprocessor is None:
+    #         return float("inf")
+    #     raw = self.lidar.get_scan()
+    #     if raw is None:
+    #         return float("inf")
+    #     processed = self.preprocessor.preprocess(raw)
+    #     return self.preprocessor.get_sector_min(
+    #         processed, -self.forward_sector, self.forward_sector
+    #     )
 
-    def follow_path(self) -> None:
-        """Reactive LiDAR controller: drive forward, steer away from obstacles."""
-        if self.lidar is None or self.preprocessor is None:
-            self.stop_robot()
-            return
-
-        raw = self.lidar.get_scan()
-        if raw is None:
-            return
-
-        scan  = self.preprocessor.preprocess(raw)
-        front = self.preprocessor.get_sector_min(scan, -self.forward_sector, self.forward_sector)
-
-        if front > self.safe_dist:
-            vx = self.max_speed
-            wz = 0.0
-        else:
-            # Obstacle ahead — compare left and right clearance, turn toward the opener side.
-            left  = self.preprocessor.get_sector_min(scan,  self.forward_sector, 120.0)
-            right = self.preprocessor.get_sector_min(scan, -120.0, -self.forward_sector)
-            vx    = 0.0
-            wz    = (self.max_wz if left > right else -self.max_wz) * self.yaw_sign
-
-        self.get_logger().info(
-            f"[LIDAR] front={front:.2f}m vx={vx:.3f} wz={wz:.3f}",
-            throttle_duration_sec=1.0,
-        )
-
-        cmd = Twist()
-        cmd.linear.x  = float(vx)
-        cmd.angular.z = float(wz)
-        self._last_sent_vx = float(vx)
-        self._last_sent_wz = float(wz)
-        self._cmd_pub.publish(cmd)
+    # def follow_path(self) -> None:
+    #     """Reactive LiDAR controller: drive forward, steer away from obstacles."""
+    #     if self.lidar is None or self.preprocessor is None:
+    #         self.stop_robot()
+    #         return
+    #
+    #     raw = self.lidar.get_scan()
+    #     if raw is None:
+    #         return
+    #
+    #     scan  = self.preprocessor.preprocess(raw)
+    #     front = self.preprocessor.get_sector_min(scan, -self.forward_sector, self.forward_sector)
+    #
+    #     if front > self.safe_dist:
+    #         vx = self.max_speed
+    #         wz = 0.0
+    #     else:
+    #         # Obstacle ahead — compare left and right clearance, turn toward the opener side.
+    #         left  = self.preprocessor.get_sector_min(scan,  self.forward_sector, 120.0)
+    #         right = self.preprocessor.get_sector_min(scan, -120.0, -self.forward_sector)
+    #         vx    = 0.0
+    #         wz    = (self.max_wz if left > right else -self.max_wz) * self.yaw_sign
+    #
+    #     self.get_logger().info(
+    #         f"[LIDAR] front={front:.2f}m vx={vx:.3f} wz={wz:.3f}",
+    #         throttle_duration_sec=1.0,
+    #     )
+    #
+    #     cmd = Twist()
+    #     cmd.linear.x  = float(vx)
+    #     cmd.angular.z = float(wz)
+    #     self._last_sent_vx = float(vx)
+    #     self._last_sent_wz = float(wz)
+    #     self._cmd_pub.publish(cmd)
 
     # ====================================================================
     # MAP / GEOMETRY
@@ -550,7 +553,7 @@ class RRTExplorer(Node):
             else:
                 self._priority_queue.append((label, goal))
         if start_now:
-            self.stop_robot()
+            # [PRESENTATION] self.stop_robot() disabled — SafeLidarMotion owns /cmd_vel.
             self.get_logger().info(
                 f"Key collected — prioritizing door {door_id} at "
                 f"({goal[0]:.2f}, {goal[1]:.2f})"
@@ -558,10 +561,11 @@ class RRTExplorer(Node):
         else:
             self.get_logger().info(f"Queued {label} behind the current key task")
 
-    def stop_robot(self) -> None:
-        self._last_sent_vx = 0.0
-        self._last_sent_wz = 0.0
-        self._cmd_pub.publish(Twist())
+    # [PRESENTATION] stop_robot disabled — SafeLidarMotion owns /cmd_vel.
+    # def stop_robot(self) -> None:
+    #     self._last_sent_vx = 0.0
+    #     self._last_sent_wz = 0.0
+    #     self._cmd_pub.publish(Twist())
 
     # ====================================================================
     # VISUALISATION
