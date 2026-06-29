@@ -1,18 +1,13 @@
 #!/usr/bin/env python3
 """
-EKF-SLAM node — fixed version.
+EKF-SLAM node — upgraded version.
 
-Changes vs previous:
-  1. Dead code removed: bresenham_line() deleted (superseded by np.linspace).
-  2. Race condition fixed: _latest_ranges / _latest_angles now protected by
-     _scan_lock; arrays are .copy()-ed on write so the reader always gets a
-     consistent snapshot.
-  3. _map_tick / _map_every removed: their only remaining job (throttling map
-     publishes) was already handled by the dedicated publish_map_step timer.
-     The "None scan" warning now uses a simple ROS throttle_duration_sec instead.
-  4. Occupancy grid endpoint comment added to explain the [:-1] / [-1] split.
-  5. Landmark init covariance tightened from 0.50 m -> 0.28 m (stays safely
-     inside the 0.80 m new_landmark_min_dist exclusion zone).
+Merged enhancements from grid_slam:
+  1. Replaced the fixed-stride corner method with the distance-invariant 
+     Ramer-Douglas-Peucker (RDP) polyline segmentation.
+  2. Integrated corner arm-length validation to filter out laser noise spikes.
+  3. Bypasses raycasting grid updates entirely during explicit spin-in-place turns
+     to prevent wall smearing and preserve map quality.
 """
 
 import math
@@ -25,7 +20,7 @@ from rclpy.node import Node
 from rclpy.callback_groups import ReentrantCallbackGroup
 
 from nav_msgs.msg import OccupancyGrid
-from geometry_msgs.msg import PoseWithCovarianceStamped
+from geometry_msgs.msg import PoseWithCovarianceStamped, Twist
 from visualization_msgs.msg import Marker, MarkerArray
 
 from sensors.lidar import LidarSensor
@@ -60,7 +55,7 @@ class EKFLidarSLAM(Node):
         # Protects the occupancy grid arrays (log_odds, cells_observed).
         self.map_lock = threading.Lock()
 
-        # FIX 2: dedicated lock for the scan stash shared between
+        # Dedicated lock for the scan stash shared between
         # correction_step (writer) and publish_map_step (reader).
         self._scan_lock = threading.Lock()
 
@@ -97,17 +92,14 @@ class EKFLidarSLAM(Node):
         self.candidate_match_dist = 0.35
         self.candidate_required_seen = 4
 
-        # ── Feature extraction ───────────────────────────────────────
-        self.jump_threshold = 0.35
-        self.min_jump_range = 0.25
-        self.max_jump_range = 3.50
-
-        self.corner_angle_min_deg = 85.0
-        self.corner_angle_max_deg = 95.0
-        self.corner_stride = 8
-        self.corner_min_range = 0.30
-        self.corner_max_range = 3.00
-        self.min_feature_separation = 0.70
+        # ── Feature extraction parameters (Upgraded via Grid SLAM) ───
+        self.corner_cluster_gap = 0.20       # m range jump -> new segment
+        self.corner_min_seg_pts = 6          # min pts to fit a segment
+        self.corner_rdp_eps = 0.04           # m split-and-merge tolerance
+        self.corner_min_angle = 1.483        # rad (~85 deg) real corner
+        self.corner_max_angle = 1.658        # rad (~95 deg) real corner
+        self.corner_min_arm = 0.15           # m min arm length each side of corner
+        self.min_feature_separation = 0.70   # m deduplication boundary
 
         # ── Occupancy grid ───────────────────────────────────────────
         self.map_resolution = 0.05        # 5 cm / cell
@@ -125,20 +117,27 @@ class EKFLidarSLAM(Node):
             (self.map_height, self.map_width), dtype=bool
         )
 
-        self.log_odds_free = -1.0
-        self.log_odds_occ = 0.85
-        self.log_odds_min = -5.0
-        self.log_odds_max = 5.0
+        self.log_odds_free = -0.9   # strong enough to clear ghost obstacles in ~2 scans
+        self.log_odds_occ  =  1.4   # walls confirmed fast (1 hit → 1.4, well above threshold)
+        self.log_odds_min  = -5.0
+        self.log_odds_max  = 10.0   # real walls saturate here, need 11 free rays to clear
         self.max_mapping_range = 4.0
+
+        # ── Rotation Freezing Logic ──────────────────────────────────
+        self._rotating = False
+        self._rotate_wz_thresh = 0.08   # rad/s — above this -> spinning
+        self._rotate_vx_thresh = 0.04   # m/s  — below this -> pivoting in place
 
         # ── Timing ───────────────────────────────────────────────────
         self.prev_odom_timestamp = None
 
-        # FIX 2: scan stash now protected by _scan_lock.
-        # Arrays are stored as copies so correction_step can keep processing
-        # its local references without the reader seeing a partial update.
         self._latest_ranges: np.ndarray | None = None
         self._latest_angles: np.ndarray | None = None
+
+        # ── Subscribers ──────────────────────────────────────────────
+        self.create_subscription(
+            Twist, "/cmd_vel", self.cmdvel_cb, 10, callback_group=self.callback_group
+        )
 
         # ── Publishers ───────────────────────────────────────────────
         self.pose_pub = self.create_publisher(
@@ -173,6 +172,16 @@ class EKFLidarSLAM(Node):
             f"({self.map_width}x{self.map_height} cells @ {self.map_resolution} m/cell), "
             f"origin ({self.map_origin_x:.1f}, {self.map_origin_y:.1f})"
         )
+
+    def cmdvel_cb(self, msg: Twist) -> None:
+        """Tracks whether the robot is turning sharply in place to freeze map smear."""
+        turning = (abs(msg.angular.z) > self._rotate_wz_thresh and
+                   abs(msg.linear.x) < self._rotate_vx_thresh)
+        if turning != self._rotating:
+            self._rotating = turning
+            self.get_logger().info(
+                f'SLAM Grid Mapping updates: {"PAUSED (spinning in place)" if turning else "ACTIVE"}'
+            )
 
     # ================================================================
     # PREDICTION
@@ -209,12 +218,6 @@ class EKFLidarSLAM(Node):
             return
 
         vx, vy, omega = vel_data["velocity"]
-        self.get_logger().info(
-            f"PRED dt={dt:.3f} theta_before={self.mu[2,0]:.2f} w={omega:.2f}"
-        )
-        self.get_logger().info(
-            f"PRED vx={vx:.3f} vy={vy:.3f} w={omega:.3f} dt={dt:.3f}"
-        )
 
         max_substep = 0.05
         n_substeps = max(1, int(math.ceil(dt / max_substep)))
@@ -244,12 +247,6 @@ class EKFLidarSLAM(Node):
 
         self.Sigma = F_full @ self.Sigma @ F_full.T + R_full
 
-        self.get_logger().info(
-            f"SLAM x={self.mu[0,0]:.2f} y={self.mu[1,0]:.2f} "
-            f"th={math.degrees(self.mu[2,0]):.0f}"
-        )
-        self.get_logger().info(f"theta_after={self.mu[2,0]:.2f}")
-
     # ================================================================
     # CORRECTION
     # ================================================================
@@ -257,12 +254,7 @@ class EKFLidarSLAM(Node):
     def correction_step(self) -> None:
         try:
             raw_scan = self.lidar.get_scan()
-            self.get_logger().info(f"DEBUG: raw_scan status is {raw_scan is not None}")
-
             if raw_scan is None:
-                # FIX 3: throttle_duration_sec replaces the old _map_tick counter,
-                # which served no purpose here after the map-publish logic moved
-                # to its own timer.
                 self.get_logger().warn(
                     "correction_step: lidar.get_scan() is None — no scan received yet",
                     throttle_duration_sec=4.0,
@@ -284,8 +276,6 @@ class EKFLidarSLAM(Node):
             for obs in observations:
                 self.process_observation(obs)
 
-            # FIX 2: stash copies so publish_map_step always sees a consistent
-            # snapshot even if this callback is called again before it runs.
             with self._scan_lock:
                 self._latest_ranges = ranges.copy()
                 self._latest_angles = angles.copy()
@@ -298,33 +288,92 @@ class EKFLidarSLAM(Node):
             )
 
     # ================================================================
-    # FEATURE EXTRACTION
+    # FEATURE EXTRACTION (Upgraded RDP + Arm Checking)
     # ================================================================
 
-    def extract_lidar_landmarks(self, points, ranges, angles) -> list:
-        observations = []
-        stride = self.corner_stride
-        for i in range(stride, len(points) - stride):
-            vec_before = points[i - stride] - points[i]
-            vec_after = points[i + stride] - points[i]
-            lb = np.linalg.norm(vec_before)
-            la = np.linalg.norm(vec_after)
-            if lb < 1e-6 or la < 1e-6:
+    def _rdp(self, pts, i0, j0):
+        """Ramer-Douglas-Peucker iterative polyline segmentation."""
+        keep = [i0, j0]
+        stack = [(i0, j0)]
+        while stack:
+            i, j = stack.pop()
+            if j <= i + 1:
                 continue
-            cos_angle = float(np.clip(
-                np.dot(vec_before, vec_after) / (lb * la), -1.0, 1.0
-            ))
-            angle_deg = math.degrees(math.acos(cos_angle))
-            r = float(ranges[i])
-            phi = float(angles[i])
-            if (self.corner_min_range < r < self.corner_max_range and
-                    self.corner_angle_min_deg < angle_deg < self.corner_angle_max_deg):
+            p0 = pts[i]
+            p1 = pts[j]
+            seg = p1 - p0
+            L = math.hypot(float(seg[0]), float(seg[1]))
+            sub = pts[i + 1:j]
+            if L < 1e-6:
+                d = np.hypot(sub[:, 0] - p0[0], sub[:, 1] - p0[1])
+            else:
+                d = np.abs(seg[0] * (p0[1] - sub[:, 1]) - seg[1] * (p0[0] - sub[:, 0])) / L
+            k = int(np.argmax(d))
+            if d[k] > self.corner_rdp_eps:
+                ki = i + 1 + k
+                keep.append(ki)
+                stack.append((i, ki))
+                stack.append((ki, j))
+        return sorted(set(keep))
+
+    def _seg_corners(self, seg, ranges_seg, angles_seg, out_obs):
+        """Processes polyline segments, extracts safe corners with arm validation."""
+        if len(seg) < self.corner_min_seg_pts:
+            return
+        pts = np.asarray(seg, dtype=np.float32)
+        idx = self._rdp(pts, 0, len(pts) - 1)
+        for k in range(1, len(idx) - 1):
+            a = pts[idx[k - 1]]
+            b = pts[idx[k]]
+            c = pts[idx[k + 1]]
+            
+            # Distance-invariant structural check (Arm Verification)
+            arm1 = math.hypot(float(a[0] - b[0]), float(a[1] - b[1]))
+            arm2 = math.hypot(float(c[0] - b[0]), float(c[1] - b[1]))
+            if arm1 < self.corner_min_arm or arm2 < self.corner_min_arm:
+                continue
+                
+            v1 = a - b
+            v2 = c - b
+            cross = float(v1[0] * v2[1] - v1[1] * v2[0])
+            dot = float(v1[0] * v2[0] + v1[1] * v2[1])
+            ang = abs(math.atan2(cross, dot))
+            
+            if self.corner_min_angle <= ang <= self.corner_max_angle:
+                orig_idx = idx[k]
+                r = float(ranges_seg[orig_idx])
+                phi = float(angles_seg[orig_idx])
+                
                 self.total_corner_detections += 1
-                observations.append({
+                out_obs.append({
                     "range": r,
                     "bearing": wrap_angle(phi),
                     "type": "corner",
                 })
+
+    def extract_lidar_landmarks(self, points, ranges, angles) -> list:
+        observations = []
+        seg = []
+        ranges_seg = []
+        angles_seg = []
+        prev_r = None
+        
+        for i in range(len(ranges)):
+            r = float(ranges[i])
+            if np.isfinite(r) and r > 0.05:
+                if prev_r is not None and abs(r - prev_r) > self.corner_cluster_gap:
+                    self._seg_corners(seg, ranges_seg, angles_seg, observations)
+                    seg, ranges_seg, angles_seg = [], [], []
+                seg.append(points[i])
+                ranges_seg.append(ranges[i])
+                angles_seg.append(angles[i])
+                prev_r = r
+            else:
+                self._seg_corners(seg, ranges_seg, angles_seg, observations)
+                seg, ranges_seg, angles_seg = [], [], []
+                prev_r = None
+                
+        self._seg_corners(seg, ranges_seg, angles_seg, observations)
         return self.remove_duplicate_observations(observations)
 
     def remove_duplicate_observations(self, observations: list) -> list:
@@ -415,22 +464,19 @@ class EKFLidarSLAM(Node):
     def ekf_correct(self, H, innovation, S) -> None:
         kalman_gain = self.Sigma @ H.T @ np.linalg.inv(S)
         correction = kalman_gain @ innovation
-        if np.linalg.norm(correction[:2]) > 0.5:
-            self.get_logger().warn("Discarding massive SLAM correction!")
+        if np.linalg.norm(correction[:2]) > 0.05:
+            self.get_logger().warn(
+                f"Discarding large xy correction ({np.linalg.norm(correction[:2])*100:.1f}cm)!")
             return
-        pose_before = self.mu[:3, 0].copy()
+        if abs(correction[2]) > math.radians(3.0):
+            self.get_logger().warn(
+                f"Discarding large theta correction ({math.degrees(correction[2]):.1f}deg)!")
+            return
 
         self.mu = self.mu + correction
         self.mu[2, 0] = wrap_angle(self.mu[2, 0])
         state_size = self.mu.shape[0]
         self.Sigma = (np.eye(state_size) - kalman_gain @ H) @ self.Sigma
-        pose_shift = self.mu[:3, 0] - pose_before
-        self.get_logger().info(
-            f"CORRECT dx={pose_shift[0]:+.3f} dy={pose_shift[1]:+.3f} "
-            f"dth={math.degrees(pose_shift[2]):+.2f} "
-            f"| innov_r={innovation[0,0]:+.3f} "
-            f"innov_b={math.degrees(innovation[1,0]):+.2f}"
-        )
 
     # ================================================================
     # CANDIDATE BUFFER
@@ -444,8 +490,7 @@ class EKFLidarSLAM(Node):
             if np.linalg.norm(world_pos - lm_pos) < self.new_landmark_min_dist:
                 return
         for candidate in self.candidate_landmarks:
-            if np.linalg.norm(world_pos - candidate["position"]) \
-                    < self.candidate_match_dist:
+            if np.linalg.norm(world_pos - candidate["position"]) < self.candidate_match_dist:
                 n = candidate["seen"]
                 new_pos = (candidate["position"] * n + world_pos) / (n + 1)
                 drift = np.linalg.norm(new_pos - candidate["position"])
@@ -454,8 +499,7 @@ class EKFLidarSLAM(Node):
                 candidate["seen"] += 1
                 STABLE_THRESHOLD = 0.08
                 if (candidate["seen"] >= self.candidate_required_seen or
-                        (candidate["seen"] >= 3
-                         and candidate["variance"] < STABLE_THRESHOLD)):
+                        (candidate["seen"] >= 3 and candidate["variance"] < STABLE_THRESHOLD)):
                     self.add_new_landmark(candidate["position"])
                     self.candidate_landmarks = [
                         c for c in self.candidate_landmarks if c is not candidate
@@ -491,9 +535,6 @@ class EKFLidarSLAM(Node):
         new_Sigma = np.zeros((new_size, new_size))
         new_Sigma[:old_size, :old_size] = self.Sigma
 
-        # FIX 5: tightened from 0.50 m → 0.28 m so the 1-sigma uncertainty
-        # ellipse (0.28 m) stays well inside the 0.80 m new_landmark_min_dist
-        # exclusion zone, reducing spurious duplicate landmark creation.
         new_Sigma[old_size,     old_size]     = 0.28 ** 2
         new_Sigma[old_size + 1, old_size + 1] = 0.28 ** 2
 
@@ -501,9 +542,6 @@ class EKFLidarSLAM(Node):
         self.Sigma = new_Sigma
         self.num_landmarks += 1
         self.total_confirmed_corners += 1
-        self.get_logger().info(
-            f"New landmark #{self.num_landmarks} at ({mx:.2f}, {my:.2f})"
-        )
 
     # ================================================================
     # OCCUPANCY GRID
@@ -519,10 +557,8 @@ class EKFLidarSLAM(Node):
             return
         x0, y0 = robot_cell
 
-        # Subsample rays: process every 4th ray to reduce Pi CPU load while
-        # keeping map detail acceptable at 5 cm resolution.
-        sub_ranges = ranges[::4]
-        sub_angles = angles[::4]
+        sub_ranges = ranges[::2]   # every 2nd ray — 2° spacing, <0.07 m gap at 2 m range
+        sub_angles = angles[::2]   # full [::1] is safer but heavier on the Pi
 
         with self.map_lock:
             for r, phi in zip(sub_ranges, sub_angles):
@@ -558,9 +594,6 @@ class EKFLidarSLAM(Node):
                 if len(cx_array) == 0:
                     continue
 
-                # All cells except the last are along the ray path → free space.
-                # The last cell is the measured endpoint → occupied (if is_hit).
-                # [:-1] and [-1] are intentionally asymmetric here.
                 self.log_odds[cy_array[:-1], cx_array[:-1]] = np.clip(
                     self.log_odds[cy_array[:-1], cx_array[:-1]] + self.log_odds_free,
                     self.log_odds_min, self.log_odds_max,
@@ -606,16 +639,6 @@ class EKFLidarSLAM(Node):
         cov[30] = self.Sigma[2, 0];  cov[31] = self.Sigma[2, 1];  cov[35] = self.Sigma[2, 2]
         msg.pose.covariance = cov.tolist()
         self.pose_pub.publish(msg)
-        try:
-            import json as _json
-            with open("/tmp/slam_pose.json", "w") as f:
-                _json.dump({
-                    "x":     float(self.mu[0, 0]),
-                    "y":     float(self.mu[1, 0]),
-                    "theta": float(self.mu[2, 0]),
-                }, f)
-        except Exception:
-            pass
 
     def publish_landmarks(self) -> None:
         if self.num_landmarks == 0:
@@ -640,27 +663,17 @@ class EKFLidarSLAM(Node):
             m.color.r = 1.0;  m.color.g = 0.0
             m.color.b = 0.0;  m.color.a = 1.0
             marker_array.markers.append(m)
-        try:
-            self.landmark_pub.publish(marker_array)
-        except Exception:
-            pass
+        self.landmark_pub.publish(marker_array)
 
     def publish_map_step(self) -> None:
-        """Timer callback: raycast the latest scan then publish the grid.
-
-        Raycasting runs here (2 Hz) rather than in correction_step (5 Hz) so
-        the heavy grid update never blocks the EKF prediction/pose loop.
-        """
         try:
-            # FIX 2: grab a reference to the current snapshot under the lock;
-            # the arrays themselves are already copies written by correction_step.
             with self._scan_lock:
                 ranges = self._latest_ranges
                 angles = self._latest_angles
 
-            if ranges is not None:
+            # Rotation safety check active: skip raycasting if spinning in place
+            if ranges is not None and not self._rotating:
                 self.update_occupancy_grid(ranges, angles)
-                self.get_logger().info("DEBUG: Raycasting grid update finished successfully!")
 
             self.publish_map()
 
@@ -680,8 +693,6 @@ class EKFLidarSLAM(Node):
         msg.info.origin.position.y = self.map_origin_y
         msg.info.origin.orientation.w = 1.0
 
-        # Copy under lock; probability conversion runs outside the lock
-        # so map_lock is held only for the minimum necessary time.
         with self.map_lock:
             log_odds_safe = np.clip(self.log_odds, -10.0, 10.0).astype(np.float32)
             cells_obs = self.cells_observed.copy()
@@ -694,14 +705,6 @@ class EKFLidarSLAM(Node):
 
         msg.data = grid_int.flatten().tolist()
         self.map_pub.publish(msg)
-
-    def print_debug_summary(self) -> None:
-        self.get_logger().info("=================================")
-        self.get_logger().info("EKF DEBUG SUMMARY")
-        self.get_logger().info(f"Corner detections:   {self.total_corner_detections}")
-        self.get_logger().info(f"Confirmed landmarks: {self.total_confirmed_corners}")
-        self.get_logger().info(f"Landmarks in EKF:    {self.num_landmarks}")
-        self.get_logger().info("=================================")
 
     # ================================================================
     # PUBLIC ACCESSORS

@@ -10,8 +10,7 @@ import rclpy
 from rclpy.executors import MultiThreadedExecutor
 from geometry_msgs.msg import Twist
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-from mapping.rrt_exploration  import RRTExplorer
-#from control.path_follower    import PathFollower
+from mapping.rrt_exploration import RRTExplorer
 from sensors.lidar    import LidarSensor
 from sensors.camera   import CameraSensor
 from sensors.odometry import OdometrySensor
@@ -51,14 +50,12 @@ def main() -> None:
 
     # ── Nodes ─────────────────────────────────────────────────────────
     calib_path = os.path.join(
-    os.path.dirname(__file__),
-    "config",
-    "camera_calibration.json"
+        os.path.dirname(__file__),
+        "config",
+        "camera_calibration.json"
     )
 
-    camera_matrix, distortion_coeffs = load_calibration(
-        calib_path
-    )
+    camera_matrix, distortion_coeffs = load_calibration(calib_path)
 
     aruco = ArucoDetector(
         camera_matrix=camera_matrix,
@@ -73,22 +70,22 @@ def main() -> None:
     )
 
     # ── Explorer ──────────────────────────────────────────────────────
-    # New RRTExplorer is a self-contained node (like the two working files):
-    # it reads the map off a topic, the pose off TF (map -> base_footprint),
-    # and /scan, then publishes /cmd_vel. It no longer takes slam/lidar/
-    # preprocessor objects. Only the SLAM map topic name needs to match what
-    # EKFLidarSLAM actually publishes.
-    rrt = RRTExplorer(map_topic="/slam_map")
-
+    rrt = RRTExplorer(
+        slam=slam,
+        lidar=lidar,
+        preprocessor=preprocessor,
+        slam_map_topic="/slam_map"
+    )
+    
     aruco_monitor = ArucoMonitor(
         camera=camera,
-        aruco=aruco,          # not aruco_detector
+        aruco=aruco,
         slam=slam,
         explorer=rrt
     )
 
-    # stop motors at startup (publisher is named cmd_pub on the new node)
-    rrt.cmd_pub.publish(Twist())
+    # stop motors at startup safely using the correct internal publisher name
+    rrt._cmd_pub.publish(Twist())
 
     # ── Executor ──────────────────────────────────────────────────────
     executor = MultiThreadedExecutor()
@@ -101,14 +98,17 @@ def main() -> None:
         rrt
     ]:
         executor.add_node(node)
+        
     try:
         executor.spin()
     except KeyboardInterrupt:
         pass
     finally:
         aruco_monitor.print_summary()
-        slam.print_debug_summary()
-        rrt.cmd_pub.publish(Twist())   # stop motors
+        # slam.print_debug_summary()
+        
+        # FIX: Changed from cmd_pub to _cmd_pub to match the upgraded class declaration
+        rrt._cmd_pub.publish(Twist())   
 
         for node in [
             rrt,

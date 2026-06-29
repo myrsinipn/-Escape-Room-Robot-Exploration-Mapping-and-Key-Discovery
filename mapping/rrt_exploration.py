@@ -27,7 +27,7 @@ import numpy as np
 from rclpy.node import Node
 from rclpy.callback_groups import ReentrantCallbackGroup
 
-from geometry_msgs.msg import Twist, PoseStamped
+from geometry_msgs.msg import Twist, PoseStamped, PointStamped
 from nav_msgs.msg import Path
 from visualization_msgs.msg import Marker
 
@@ -59,11 +59,11 @@ class RRTExplorer(Node):
         lidar=None,
         preprocessor=None,
         step_size: float = 0.50,
-        max_iterations: int = 600,
-        robot_radius_cells: int = 3,
-        min_known_cells: int = 600,
+        max_iterations: int = 1000,
+        robot_radius_cells: int = 5,   # 5 × 0.05 m = 0.25 m clearance from any marked obstacle
+        min_known_cells: int = 800,
         min_plan_interval: float = 2.0,
-        slam_map_topic: str = "/slam_map",   # accepted for compatibility; unused
+        slam_map_topic: str = "/slam_map",
         cmd_vel_topic: str = "/cmd_vel",
     ) -> None:
         super().__init__("rrt_frontier_explorer")
@@ -82,37 +82,27 @@ class RRTExplorer(Node):
 
         # ---- control params ----
         self.control_period = 0.05
-        self.planner_period = 3.0        # check for new plan every 3s (was 1s)
-        self.wp_tol = 0.10
-        self.goal_tolerance = 0.40
+        self.planner_period = 3.0
+        self.wp_tol = 0.35           # waypoint acceptance radius (m)
+        self.goal_tolerance = 0.40   # final-goal acceptance radius (m)
+        self.max_speed  = 0.05       # m/s — forward speed during DRIVE
+        self.turn_speed = 0.0        # m/s — pure pivot during TURN; triggers SLAM pause (abs(vx)<0.04)
+        self.k_yaw      = 0.6        # proportional gain: heading_err → wz
+        self.max_wz     = 0.35       # rad/s cap during TURN
+        self.drive_wz_cap = self.max_wz          # full wz during DRIVE — fast recovery, no orbit risk
+        self.turn_enter = math.radians(90.0)  # re-enter TURN only if facing backward
+        self.turn_exit  = math.radians(6.0)   # stop turning once tightly aligned
+        self.yaw_sign   = 1.0        # flip to -1.0 if robot spins the wrong way
 
-        self.max_speed = 0.05
-        self.k_v = 0.6
-        self.k_yaw = 0.8
-        self.max_wz = 0.40
-        self.close_wz = 0.25
-        self.turn_thresh = 0.35     # rad (~20 deg): spin in place above this
-        self.align_thresh = 0.17    # rad (~10 deg): resume driving below this
-        self.turn_timeout = 8.0
-        self.turning = False
-        self._turning_since: float = 0.0
-
-        # >>> If the robot spins in place forever, set this to -1.0 <<<
-        self.yaw_sign = -1.0
-
-        # ---- backup recovery ----
-        self.backup_dist = 0.15
-        self.backup_speed = 0.06
-        self.front_safety_angle = math.radians(15.0)
-        self.front_stop_distance = 0.20
+        # ---- two-phase controller state ----
+        self._turning  = True   # start in TURN mode for first waypoint
+        self._prev_wp  = -1     # detect waypoint advances to reset phase
 
         # ---- shared state (guarded by _lock) ----
         self._lock = threading.RLock()
         self.current_path: List[np.ndarray] = []
         self.waypoint_index = 0
         self.active_goal: Optional[np.ndarray] = None
-        self.backing = False
-        self.backup_from: Optional[np.ndarray] = None
         self.exploration_complete = False
         self._need_replan = True
         self._last_plan_time = -1e9
@@ -122,31 +112,16 @@ class RRTExplorer(Node):
         self._cmd_pub = self.create_publisher(Twist, cmd_vel_topic, 10)
         self.path_pub = self.create_publisher(Path, "/exploration_path", 1)
         self.goal_pub = self.create_publisher(Marker, "/rrt_goal", 1)
+        self._wp_pub  = self.create_publisher(PointStamped, "/exploration_current_wp", 1)
 
-        # Diagnostic: log when cmd_vel arrives from outside (aruco_monitor override)
         self._last_sent_wz: float = 0.0
         self._last_sent_vx: float = 0.0
-        self.create_subscription(
-            Twist, cmd_vel_topic, self._cmdvel_spy_cb, 10,
-            callback_group=self.cb_group)
 
         # ---- timers ----
         self.create_timer(self.planner_period, self._plan_cb, callback_group=self.cb_group)
         self.create_timer(self.control_period, self._ctrl_cb, callback_group=self.cb_group)
 
         self.get_logger().info("RRT frontier explorer initialized (minimal).")
-
-    def _cmdvel_spy_cb(self, msg: Twist) -> None:
-        """Detects if an external node is overriding our cmd_vel."""
-        vx = round(msg.linear.x, 3)
-        wz = round(msg.angular.z, 3)
-        exp_vx = round(self._last_sent_vx, 3)
-        exp_wz = round(self._last_sent_wz, 3)
-        if vx != exp_vx or wz != exp_wz:
-            self.get_logger().warn(
-                f"[OVERRIDE] cmd_vel got vx={vx} wz={wz} "
-                f"but explorer last sent vx={exp_vx} wz={exp_wz}",
-                throttle_duration_sec=1.0)
 
     # ====================================================================
     # TIMERS
@@ -170,7 +145,7 @@ class RRTExplorer(Node):
     # ====================================================================
     def plan_if_needed(self) -> None:
         with self._lock:
-            if self.exploration_complete or self.backing:
+            if self.exploration_complete:
                 return
 
         pose = self.get_robot_pose()
@@ -195,8 +170,10 @@ class RRTExplorer(Node):
             have_path = bool(self.current_path)
             need_replan = self._need_replan
         if have_path and not need_replan:
-            if self.path_blocked_by_obstacle(snap, pose):
-                self.get_logger().warn("Path blocked — replanning.")
+            diverged = self._robot_diverged_from_path(pose[:2])
+            if diverged or self.path_blocked_by_obstacle(snap, pose):
+                reason = "drifted away from path" if diverged else "path blocked by obstacle"
+                self.get_logger().warn(f"Replanning: {reason}.")
                 with self._lock:
                     self.current_path = []
                     self.waypoint_index = 0
@@ -204,7 +181,7 @@ class RRTExplorer(Node):
                     self._need_replan = True
                 self.stop_robot()
             else:
-                return   # path still fine, let follower execute it
+                return   # path still valid, let follower execute it
 
         now = self.get_clock().now().nanoseconds * 1e-9
         if now - self._last_plan_time < self.min_plan_interval:
@@ -219,19 +196,18 @@ class RRTExplorer(Node):
             self._last_plan_time = now
             with self._lock:
                 self._need_replan = False
-            path = self.build_path(snap, pose[:2])
+            path = self.build_path(snap, pose[:2], heading=float(pose[2]))
             if path is None or len(path) < 2:
                 with self._lock:
                     self.current_path = []
                     self.waypoint_index = 0
                     self.active_goal = None
-                if known > 3500:
-                    with self._lock:
-                        self.exploration_complete = True
-                    self.get_logger().info("No reachable frontiers remain. Exploration complete.")
-                else:
-                    self.get_logger().warn("No path yet, space still fresh. Retrying...",
-                                           throttle_duration_sec=4.0)
+                    self._need_replan = True   # try again on next planner tick
+                self.get_logger().warn(
+                    f"No reachable frontier found (known={known} cells). "
+                    "Will retry when map updates.",
+                    throttle_duration_sec=4.0,
+                )
                 self.stop_robot()
                 self.publish_path([])
                 return
@@ -240,7 +216,7 @@ class RRTExplorer(Node):
             with self._lock:
                 self._planning = False
 
-    def build_path(self, snap: MapSnapshot, start_xy) -> Optional[List[np.ndarray]]:
+    def build_path(self, snap: MapSnapshot, start_xy, heading: float = 0.0) -> Optional[List[np.ndarray]]:
         start_xy = np.array(start_xy, dtype=float)
         if not self.point_safe(start_xy, snap):
             repl = self.nearest_safe(start_xy, snap)
@@ -284,7 +260,14 @@ class RRTExplorer(Node):
 
         if not frontiers:
             return None
-        best = min(frontiers, key=lambda f: math.hypot(f[0] - start_xy[0], f[1] - start_xy[1]))
+        # Cost = distance + turn penalty: a 180° turn costs ~0.6 m equivalent
+        # so the planner prefers frontiers roughly in front of the robot.
+        def _frontier_cost(f):
+            dist = math.hypot(f[0] - start_xy[0], f[1] - start_xy[1])
+            bearing = math.atan2(f[1] - start_xy[1], f[0] - start_xy[0])
+            turn = abs(wrap_angle(bearing - heading))   # 0 .. π
+            return dist + (turn / math.pi) * 0.6
+        best = min(frontiers, key=_frontier_cost)
         return self.reconstruct(nodes, parents, best[2])
 
     def nearest_node(self, nodes, sx, sy) -> int:
@@ -303,28 +286,53 @@ class RRTExplorer(Node):
         path.reverse()
         return path
 
-    def path_blocked_by_obstacle(self, snap: MapSnapshot, pose) -> bool:
-        """Return True only if a map cell along the remaining path is occupied.
-        This is stricter than path_is_valid — it ignores inflation-border changes
-        so a valid path is not cancelled just because the robot hasn't moved yet."""
+    def _robot_diverged_from_path(self, robot_xy, max_deviation: float = 1.0) -> bool:
+        """True when robot is farther than max_deviation from every remaining waypoint.
+
+        This catches stale plans: robot drifted away (obstacle backup, SLAM jump)
+        but path_blocked_by_obstacle returns False because the cells are still free.
+        """
         with self._lock:
             path = self.current_path
             wp = self.waypoint_index
         if not path:
             return False
-        remaining = [pose[:2]] + path[wp:]
+        rx, ry = float(robot_xy[0]), float(robot_xy[1])
+        for pt in path[wp:]:
+            if math.hypot(pt[0] - rx, pt[1] - ry) < max_deviation:
+                return False   # close enough to at least one remaining waypoint
+        self.get_logger().warn(
+            f"Robot at ({rx:.2f},{ry:.2f}) is >{max_deviation:.1f}m from all remaining waypoints.",
+            throttle_duration_sec=2.0,
+        )
+        return True
+
+    def path_blocked_by_obstacle(self, snap: MapSnapshot, pose) -> bool:
+        """True if a newly-observed occupied cell falls on any remaining path segment.
+
+        Only checks grid >= 50 (actual walls), NOT the inflation buffer.
+        Paths are planned using the full safe mask so they start inflation-free;
+        we only need to replan when a genuine new wall appears on the path itself.
+        Checking inflation would trigger constant replanning as walls solidify.
+        """
+        with self._lock:
+            path = self.current_path
+            wp = self.waypoint_index
+        if not path or wp >= len(path):
+            return False
+        remaining = [pose[:2]] + [p for p in path[wp:]]
         for a, b in zip(remaining[:-1], remaining[1:]):
-            dx, dy = b[0] - a[0], b[1] - a[1]
+            dx, dy = float(b[0] - a[0]), float(b[1] - a[1])
             dist = math.hypot(dx, dy)
             if dist < 1e-6:
                 continue
-            steps = max(int(dist / snap.resolution), 1)
+            steps = max(int(dist / (snap.resolution * 0.5)), 1)
             for k in range(steps + 1):
                 t = k / steps
                 cx = int((a[0] + t * dx - snap.origin_x) / snap.resolution)
                 cy = int((a[1] + t * dy - snap.origin_y) / snap.resolution)
                 if 0 <= cx < snap.width and 0 <= cy < snap.height:
-                    if snap.grid[cy, cx] >= 50:   # actually occupied cell
+                    if snap.grid[cy, cx] >= 50:
                         return True
         return False
 
@@ -349,9 +357,6 @@ class RRTExplorer(Node):
             self.active_goal = self.current_path[-1].copy()
             pub_path = list(self.current_path)
             pub_goal = self.active_goal.copy()
-        # always reset turn latch when a new path arrives
-        self.turning = False
-        self._turning_since = 0.0
         self.get_logger().info(
             f"[plan] new goal=({pub_goal[0]:.2f},{pub_goal[1]:.2f}) "
             f"waypoints={len(pub_path)}",
@@ -360,7 +365,7 @@ class RRTExplorer(Node):
         self.publish_goal(pub_goal)
 
     # ====================================================================
-    # FOLLOWER
+    # FOLLOWER  (map-based planning → no obstacle avoidance needed here)
     # ====================================================================
     def follow_path(self) -> None:
         pose = self.get_robot_pose()
@@ -368,39 +373,14 @@ class RRTExplorer(Node):
             return
         rx, ry, rth = float(pose[0]), float(pose[1]), float(pose[2])
 
-        # consistent snapshot
         with self._lock:
-            backing = self.backing
-            backup_from = self.backup_from
             path = self.current_path
             goal = self.active_goal
-            wp = self.waypoint_index
+            wp   = self.waypoint_index
             done = self.exploration_complete
-
-        # ---- backup recovery ----
-        if backing:
-            if backup_from is None:
-                self.stop_robot()
-                return
-            moved = math.hypot(rx - backup_from[0], ry - backup_from[1])
-            if moved >= self.backup_dist or not self.front_too_close():
-                self.stop_robot()
-                with self._lock:
-                    self.backing = False
-                    self._need_replan = True
-                return
-            cmd = Twist()
-            cmd.linear.x = -self.backup_speed
-            self._cmd_pub.publish(cmd)
-            return
 
         if done or not path or goal is None:
             self.stop_robot()
-            return
-
-        if self.front_too_close():
-            self.get_logger().warn("Obstacle ahead. Backing up.")
-            self.start_backup(rx, ry)
             return
 
         # reached final goal?
@@ -413,13 +393,9 @@ class RRTExplorer(Node):
                 self._need_replan = True
             return
 
-        # advance through reached waypoints
-        while wp < len(path):
-            tx, ty = path[wp]
-            if math.hypot(tx - rx, ty - ry) < self.wp_tol:
-                wp += 1
-            else:
-                break
+        # advance past waypoints already within wp_tol
+        while wp < len(path) and math.hypot(path[wp][0] - rx, path[wp][1] - ry) < self.wp_tol:
+            wp += 1
         with self._lock:
             if self.current_path is path:
                 self.waypoint_index = wp
@@ -430,53 +406,72 @@ class RRTExplorer(Node):
                 self._need_replan = True
             return
 
+        # publish current target waypoint for debug_viz
+        _wps = PointStamped()
+        _wps.header.stamp = self.get_clock().now().to_msg()
+        _wps.header.frame_id = "map"
+        _wps.point.x = float(path[wp][0])
+        _wps.point.y = float(path[wp][1])
+        self._wp_pub.publish(_wps)
+
+        # ------------------------------------------------------------------
+        # Two-phase waypoint follower
+        #
+        # Phase 1 – TURN IN PLACE:  rotate until facing the waypoint within
+        #           align_threshold.  vx=0 so the robot does not arc away.
+        # Phase 2 – DRIVE STRAIGHT: go forward at max_speed with only a
+        #           gentle heading correction (small wz cap) so the line
+        #           from robot to waypoint stays straight and dist strictly
+        #           decreases.
+        #
+        # Running vx and wz simultaneously at large errors caused the robot
+        # to orbit the waypoint (circular arc) instead of approaching it.
+        # ------------------------------------------------------------------
         tx, ty = float(path[wp][0]), float(path[wp][1])
-        dist = math.hypot(tx - rx, ty - ry)
-        yaw_err = wrap_angle(math.atan2(ty - ry, tx - rx) - rth)
-        now = self.get_clock().now().nanoseconds * 1e-9
+        dist        = math.hypot(tx - rx, ty - ry)
+        heading_err = wrap_angle(math.atan2(ty - ry, tx - rx) - rth)
+
+        # Reset to TURN mode whenever the active waypoint changes.
+        if wp != self._prev_wp:
+            self._turning = True
+            self._prev_wp = wp
+
+        # Hysteresis: enter TURN at >18°, exit TURN at <6°.
+        # This prevents EKF theta corrections (≤3°) from constantly flipping phases.
+        if self._turning:
+            if abs(heading_err) < self.turn_exit:
+                self._turning = False
+        else:
+            if abs(heading_err) > self.turn_enter:
+                self._turning = True
+
+        if self._turning:
+            # TURN: rotate toward waypoint.
+            # vx=0.04 keeps SLAM active (pause threshold is abs(vx) < 0.04).
+            vx    = self.turn_speed
+            wz    = clamp(self.yaw_sign * self.k_yaw * heading_err, -self.max_wz, self.max_wz)
+            phase = "TURN"
+        else:
+            # DRIVE: go straight, tiny heading correction only.
+            vx    = self.max_speed
+            wz    = clamp(self.yaw_sign * self.k_yaw * heading_err, -self.drive_wz_cap, self.drive_wz_cap)
+            phase = "DRIVE"
 
         self.get_logger().info(
-            f"[follow] wp={wp}/{len(path)} dist={dist:.2f} "
-            f"yaw_err={math.degrees(yaw_err):.0f}deg "
-            f"turning={self.turning}",
+            f"[{phase}] wp={wp}/{len(path)-1} "
+            f"target=({tx:.2f},{ty:.2f}) dist={dist:.2f}m "
+            f"yaw_err={math.degrees(heading_err):.0f}deg "
+            f"vx={vx:.3f} wz={wz:.3f}",
             throttle_duration_sec=1.0)
 
-        # Turn-in-place hysteresis with timeout escape.
-        # Large heading error -> rotate in place (no forward motion).
-        # If still turning after turn_timeout seconds, force drive anyway
-        # so the robot never gets permanently stuck in a turn-only state.
-        if self.turning:
-            if abs(yaw_err) < self.align_thresh:
-                self.turning = False
-            elif now - self._turning_since > self.turn_timeout:
-                self.get_logger().warn(
-                    f"Turn timeout ({self.turn_timeout}s) exceeded — forcing drive.")
-                self.turning = False
-        elif abs(yaw_err) > self.turn_thresh:
-            self.turning = True
-            self._turning_since = now
-
         cmd = Twist()
-        if self.turning:
-            cmd.angular.z = clamp(self.yaw_sign * self.k_yaw * yaw_err,
-                                  -self.max_wz, self.max_wz)
-        else:
-            cmd.linear.x = min(self.max_speed, self.k_v * dist)
-            cmd.angular.z = clamp(self.yaw_sign * self.k_yaw * yaw_err,
-                                  -self.close_wz, self.close_wz)
+        cmd.linear.x  = float(vx)
+        cmd.angular.z = float(wz)
         self._last_sent_vx = cmd.linear.x
         self._last_sent_wz = cmd.angular.z
         self._cmd_pub.publish(cmd)
 
-    def start_backup(self, rx: float, ry: float) -> None:
-        self.stop_robot()
-        with self._lock:
-            self.current_path = []
-            self.waypoint_index = 0
-            self.active_goal = None
-            self.backup_from = np.array([rx, ry])
-            self.backing = True
-
+    # ----------------------------------------------------------------------
     # ====================================================================
     # MAP / GEOMETRY (reads conventions straight from SLAM)
     # ====================================================================
@@ -488,8 +483,8 @@ class RRTExplorer(Node):
             return None
         h, w = log_odds.shape
         grid = np.full((h, w), -1, dtype=np.int16)
-        grid[observed & (log_odds > 0.10)] = 100
-        grid[observed & (log_odds <= 0.10)] = 0
+        grid[observed & (log_odds > 0.5)] = 100   # requires net positive hit evidence
+        grid[observed & (log_odds <= 0.5)] = 0
         occ = grid >= 50
         inflated = self.inflate(occ, self.robot_radius_cells)
         safe = (grid == 0) & (~inflated)
@@ -528,7 +523,10 @@ class RRTExplorer(Node):
         dist = math.hypot(dx, dy)
         if dist < 1e-6:
             return True
-        steps = max(int(dist / snap.resolution), 1)
+        # Half-cell steps so diagonal segments never skip a cell.
+        # A diagonal crosses a cell every √2×res ≈ 0.07 m; sampling at res/2 = 0.025 m
+        # guarantees every cell on the line is visited at least once.
+        steps = max(int(dist / (snap.resolution * 0.5)), 1)
         for k in range(steps + 1):
             t = k / steps
             cx = int((a[0] + t * dx - snap.origin_x) / snap.resolution)
@@ -542,7 +540,7 @@ class RRTExplorer(Node):
         cy0 = int((p[1] - snap.origin_y) / snap.resolution)
         if not (0 <= cx0 < snap.width and 0 <= cy0 < snap.height):
             return None
-        for r in range(1, 20):
+        for r in range(1, 60):   # search up to 3 m (was 1 m) to survive SLAM drift
             x0, x1 = max(0, cx0 - r), min(snap.width - 1, cx0 + r)
             y0, y1 = max(0, cy0 - r), min(snap.height - 1, cy0 + r)
             win = snap.safe[y0:y1 + 1, x0:x1 + 1]
@@ -556,25 +554,6 @@ class RRTExplorer(Node):
                         best_d, best_p = d, np.array([wx, wy])
                 return best_p
         return None
-
-    def front_too_close(self) -> bool:
-        if self.lidar is None or self.preprocessor is None:
-            return False
-        try:
-            raw = self.lidar.get_scan()
-            if raw is None:
-                return False
-            proc = self.preprocessor.preprocess(raw)
-            ranges = np.asarray(proc["ranges"], dtype=float)
-            angles = np.asarray(proc["angles"], dtype=float)
-            valid = np.isfinite(ranges) & (ranges > 0.05)
-            # "front" = bearing near 0; flip with `angles + pi` if your lidar's 0 is the rear
-            front = valid & (np.abs(wrap_angle(angles)) < self.front_safety_angle)
-            if np.any(front):
-                return float(np.min(ranges[front])) < self.front_stop_distance
-            return False
-        except Exception:
-            return False
 
     def get_robot_pose(self) -> Optional[np.ndarray]:
         try:
