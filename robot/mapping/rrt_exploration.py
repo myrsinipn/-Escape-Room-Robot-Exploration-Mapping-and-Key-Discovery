@@ -1,16 +1,19 @@
-#!/usr/bin/env python3
+!/usr/bin/env python3
 """
-RRT frontier exploration + waypoint follower for B07 Escape Room Robot.
+RRT frontier exploration + waypoint follower.
 
-Minimal, thread-safe version.
-  - Planner timer (slow) builds an RRT path toward the nearest frontier.
-  - Control timer (fast) follows the current path.
-Both run on separate threads (MultiThreadedExecutor + ReentrantCallbackGroup),
-so all shared navigation state is protected by a single lock and the follower
-works on a consistent snapshot.
+Two timers run concurrently on separate threads:
+  - Planner timer (slow, 3 s): builds an RRT path toward the nearest frontier
+    and publishes it to RViz.
+  - Control timer (fast, 20 Hz): reactive LiDAR controller that drives the
+    robot forward and steers away from obstacles.
 
-If the robot SPINS IN PLACE forever: your odom/motion-model yaw sign is likely
-inverted relative to cmd_vel. Flip `self.yaw_sign` below from +1.0 to -1.0.
+All shared navigation state is protected by a single RLock so the controller
+always operates on a consistent snapshot.
+
+Tip: if the robot spins in place indefinitely, the odometry / motion-model
+yaw sign is likely inverted relative to cmd_vel.  Flip ``self.yaw_sign``
+from +1.0 to -1.0 to correct it.
 """
 
 from __future__ import annotations
@@ -34,6 +37,7 @@ from visualization_msgs.msg import Marker
 
 
 def wrap_angle(a: float) -> float:
+    """Wrap angle to [-pi, pi]."""
     return math.atan2(math.sin(a), math.cos(a))
 
 
@@ -43,6 +47,7 @@ def clamp(v: float, lo: float, hi: float) -> float:
 
 @dataclass
 class MapSnapshot:
+    """Immutable snapshot of the SLAM grid taken at planning time."""
     grid: np.ndarray
     safe: np.ndarray
     resolution: float
@@ -61,7 +66,7 @@ class RRTExplorer(Node):
         preprocessor=None,
         step_size: float = 0.50,
         max_iterations: int = 1000,
-        robot_radius_cells: int = 5,   # 5 × 0.05 m = 0.25 m clearance from any marked obstacle
+        robot_radius_cells: int = 5,   # 5 cells × 0.05 m/cell = 0.25 m clearance
         min_known_cells: int = 800,
         min_plan_interval: float = 2.0,
         slam_map_topic: str = "/slam_map",
@@ -70,76 +75,78 @@ class RRTExplorer(Node):
         super().__init__("rrt_frontier_explorer")
         self.cb_group = ReentrantCallbackGroup()
 
-        self.slam = slam
-        self.lidar = lidar
+        self.slam         = slam
+        self.lidar        = lidar
         self.preprocessor = preprocessor
 
-        # ---- RRT params ----
-        self.step_size = float(step_size)
-        self.max_iterations = int(max_iterations)
+        # ── RRT planner parameters ────────────────────────────────────
+        self.step_size          = float(step_size)
+        self.max_iterations     = int(max_iterations)
         self.robot_radius_cells = int(robot_radius_cells)
-        self.min_known_cells = int(min_known_cells)
-        self.min_plan_interval = float(min_plan_interval)
-        # Keep exploration goals local, but outside the robot/goal-tolerance
-        # footprint. The preferred radius prevents the nearest RRT node from
-        # repeatedly becoming a goal almost underneath the robot.
-        self.min_frontier_dist = 0.75
-        self.preferred_frontier_dist = 1.0
-        self.max_frontier_dist = 1.35
+        self.min_known_cells    = int(min_known_cells)
+        self.min_plan_interval  = float(min_plan_interval)
 
-        # ---- control params ----
-        self.control_period = 0.05
-        self.planner_period = 3.0
-        self.goal_tolerance = 0.40   # accept goal when within this radius (m)
-        self.max_speed  = 0.05       # m/s — forward speed when aligned with goal
-        self.k_yaw      = 0.6        # proportional gain: heading_err → wz
-        self.max_wz     = 0.35       # rad/s — angular velocity cap
-        self.yaw_sign   = 1.0        # flip to -1.0 if robot spins the wrong way
+        # Frontier distance window: goals too close are inside the robot's
+        # footprint; goals too far may not be reachable in a single RRT run.
+        self.min_frontier_dist       = 0.75   # m
+        self.preferred_frontier_dist = 1.0    # m — scored closest to this wins
+        self.max_frontier_dist       = 1.35   # m
 
-        # ---- LiDAR safety (forward obstacle detection) ----
-        self.safe_dist        = 0.30   # m — stop if obstacle closer than this
-        self.forward_sector   = 40.0   # degrees — sector checked (±40° from forward)
-        self._obstacle_timeout = 3.0   # s — how long to wait before escape spin
+        # ── Path-follower / controller parameters ────────────────────
+        self.control_period = 0.05      # 20 Hz
+        self.planner_period = 3.0       # s
+        self.goal_tolerance = 0.40      # m — accept goal when within this radius
+        self.max_speed      = 0.05      # m/s — forward speed when aligned
+        self.k_yaw          = 0.6       # proportional gain: heading error → wz
+        self.max_wz         = 0.35      # rad/s — angular velocity cap
+        self.yaw_sign       = 1.0       # flip to -1.0 if robot turns the wrong way
+
+        # ── LiDAR forward-obstacle detection ─────────────────────────
+        self.safe_dist         = 0.30   # m — stop below this clearance
+        self.forward_sector    = 40.0   # degrees — checked sector (±40° from front)
+        self._obstacle_timeout = 3.0    # s — wait before triggering escape spin
         self._obstacle_since: Optional[float] = None
         self._escaping = False
         self._escape_yaw_target: Optional[float] = None
 
-        # ---- shared state (guarded by _lock) ----
+        # ── Shared navigation state (guarded by _lock) ────────────────
         self._lock = threading.RLock()
         self.current_path: List[np.ndarray] = []
-        self.waypoint_index = 0
+        self.waypoint_index   = 0
         self.active_goal: Optional[np.ndarray] = None
         self.exploration_complete = False
-        self._need_replan = True
-        self._last_plan_time = -1e9
-        self._planning = False
+        self._need_replan     = True
+        self._last_plan_time  = -1e9
+        self._planning        = False
 
-        # Semantic navigation state. Locked doors are virtual obstacles laid
-        # over the SLAM grid. A priority goal temporarily pre-empts frontier
-        # exploration (for example, revisiting a door after collecting its key).
+        # Semantic navigation state.
+        # Locked doors are virtual obstacles overlaid on the SLAM grid.
+        # A priority goal temporarily pre-empts frontier exploration
+        # (e.g. revisiting a door after its key is collected).
         self._locked_doors: Dict[int, Tuple[np.ndarray, np.ndarray]] = {}
-        self._priority_goal: Optional[np.ndarray] = None
-        self._priority_label: Optional[str] = None
+        self._priority_goal:  Optional[np.ndarray] = None
+        self._priority_label: Optional[str]        = None
         self._priority_queue: List[Tuple[str, np.ndarray]] = []
         self._navigation_revision = 0
 
-        # ---- pubs ----
-        self._cmd_pub = self.create_publisher(Twist, cmd_vel_topic, 10)
-        self.path_pub = self.create_publisher(Path, "/exploration_path", 1)
-        self.goal_pub = self.create_publisher(Marker, "/rrt_goal", 1)
+        # ── Publishers ────────────────────────────────────────────────
+        self._cmd_pub  = self.create_publisher(Twist,  cmd_vel_topic,      10)
+        self.path_pub  = self.create_publisher(Path,   "/exploration_path", 1)
+        self.goal_pub  = self.create_publisher(Marker, "/rrt_goal",         1)
 
         self._last_sent_wz: float = 0.0
         self._last_sent_vx: float = 0.0
 
-        # ---- timers ----
-        self.create_timer(self.planner_period, self._plan_cb, callback_group=self.cb_group)
-        self.create_timer(self.control_period, self._ctrl_cb, callback_group=self.cb_group)
+        # ── Timers ────────────────────────────────────────────────────
+        self.create_timer(self.planner_period, self._plan_cb,  callback_group=self.cb_group)
+        self.create_timer(self.control_period, self._ctrl_cb,  callback_group=self.cb_group)
 
-        self.get_logger().info("RRT frontier explorer initialized (minimal).")
+        self.get_logger().info("RRT frontier explorer initialized.")
 
     # ====================================================================
-    # TIMERS
+    # TIMER CALLBACKS
     # ====================================================================
+
     def _plan_cb(self) -> None:
         try:
             self.plan_if_needed()
@@ -157,10 +164,13 @@ class RRTExplorer(Node):
     # ====================================================================
     # PLANNER
     # ====================================================================
+
     def plan_if_needed(self) -> None:
-        # RViz-only mode: build an RRT path from current pose and publish it for
-        # visualisation.  The robot is driven by the reactive LiDAR controller in
-        # follow_path() and does NOT follow these paths.
+        """Build an RRT path to the nearest frontier and publish it for RViz.
+
+        The robot is driven by the reactive LiDAR controller in follow_path()
+        and does NOT track these paths directly.
+        """
         pose = self.get_robot_pose()
         if pose is None:
             return
@@ -172,7 +182,8 @@ class RRTExplorer(Node):
         if known < self.min_known_cells:
             self.get_logger().info(
                 f"Waiting for map context ({known}/{self.min_known_cells} cells).",
-                throttle_duration_sec=3.0)
+                throttle_duration_sec=3.0,
+            )
             return
 
         now = self.get_clock().now().nanoseconds * 1e-9
@@ -189,24 +200,37 @@ class RRTExplorer(Node):
             if path and len(path) >= 2:
                 with self._lock:
                     self.current_path = path
-                    self.active_goal = path[-1].copy()
+                    self.active_goal  = path[-1].copy()
                 self.publish_path(path)
                 self.publish_goal(path[-1])
                 self.get_logger().info(
                     f"[RViz] RRT path: {len(path)} nodes → "
                     f"goal=({path[-1][0]:.2f},{path[-1][1]:.2f})",
-                    throttle_duration_sec=2.0)
+                    throttle_duration_sec=2.0,
+                )
             else:
                 self.publish_path([])
                 self.publish_goal(None)
                 self.get_logger().info(
                     "No frontier found yet — map too small or fully explored.",
-                    throttle_duration_sec=4.0)
+                    throttle_duration_sec=4.0,
+                )
         finally:
             with self._lock:
                 self._planning = False
 
-    def build_path(self, snap: MapSnapshot, start_xy, heading: float = 0.0) -> Optional[List[np.ndarray]]:
+    def build_path(
+        self,
+        snap: MapSnapshot,
+        start_xy,
+        heading: float = 0.0,
+    ) -> Optional[List[np.ndarray]]:
+        """Run RRT from start_xy toward the best frontier in snap.
+
+        Frontiers are scored by how close they are to preferred_frontier_dist
+        with a small heading-alignment tie-breaker.  Returns the path to the
+        best safe frontier, or None if no suitable frontier was found.
+        """
         start_xy = np.array(start_xy, dtype=float)
         if not self.point_safe(start_xy, snap):
             repl = self.nearest_safe(start_xy, snap)
@@ -214,27 +238,28 @@ class RRTExplorer(Node):
                 return None
             start_xy = repl
 
-        nodes: List[np.ndarray] = [start_xy]
-        parents: List[int] = [-1]
+        nodes: List[np.ndarray]              = [start_xy]
+        parents: List[int]                   = [-1]
         frontiers: List[Tuple[float, float, int]] = []
         h, w = snap.height, snap.width
 
         for _ in range(self.max_iterations):
+            # Bias 30% of samples toward known frontiers to speed up convergence.
             if random.random() < 0.30 and frontiers:
-                f = frontiers[random.randint(0, len(frontiers) - 1)]
+                f  = frontiers[random.randint(0, len(frontiers) - 1)]
                 xr = f[0] + random.uniform(-self.step_size, self.step_size)
                 yr = f[1] + random.uniform(-self.step_size, self.step_size)
             else:
-                th = random.uniform(-math.pi, math.pi)
+                th  = random.uniform(-math.pi, math.pi)
                 rad = self.max_frontier_dist * math.sqrt(random.random())
-                xr = start_xy[0] + rad * math.cos(th)
-                yr = start_xy[1] + rad * math.sin(th)
+                xr  = start_xy[0] + rad * math.cos(th)
+                yr  = start_xy[1] + rad * math.sin(th)
 
-            bi = self.nearest_node(nodes, xr, yr)
+            bi  = self.nearest_node(nodes, xr, yr)
             nx, ny = nodes[bi]
             ang = math.atan2(yr - ny, xr - nx)
-            x1 = nx + self.step_size * math.cos(ang)
-            y1 = ny + self.step_size * math.sin(ang)
+            x1  = nx + self.step_size * math.cos(ang)
+            y1  = ny + self.step_size * math.sin(ang)
             new = np.array([x1, y1])
 
             if not self.point_safe(new, snap) or not self.line_safe(nodes[bi], new, snap):
@@ -242,6 +267,7 @@ class RRTExplorer(Node):
             nodes.append(new)
             parents.append(bi)
 
+            # Record the node as a frontier candidate if it borders unknown cells.
             gx = int((x1 - snap.origin_x) / snap.resolution)
             gy = int((y1 - snap.origin_y) / snap.resolution)
             if 1 <= gx < w - 1 and 1 <= gy < h - 1:
@@ -253,31 +279,28 @@ class RRTExplorer(Node):
         if not frontiers:
             return None
 
-        # Prefer a short goal around 1 m away instead of always selecting the
-        # nearest admissible node. Heading is only a small tie-breaker.
         def _frontier_cost(f):
-            dist = math.hypot(f[0] - start_xy[0], f[1] - start_xy[1])
+            dist    = math.hypot(f[0] - start_xy[0], f[1] - start_xy[1])
             bearing = math.atan2(f[1] - start_xy[1], f[0] - start_xy[0])
-            turn = abs(wrap_angle(bearing - heading))
+            turn    = abs(wrap_angle(bearing - heading))
+            # Primary score: closeness to preferred distance; secondary: heading alignment.
             return abs(dist - self.preferred_frontier_dist) + (turn / math.pi) * 0.25
 
-        # Get a fresh snapshot to validate against — planning takes time and
-        # the map may have changed since `snap` was taken at the start of planning.
+        # Validate frontiers against a fresh snapshot — the map can change
+        # during the RRT loop and a frontier may now be behind a wall.
         fresh = self.get_map_snapshot() or snap
 
-        # Iterate frontiers cheapest-first; skip any whose goal cell is now
-        # occupied or inside the inflation buffer in the fresh map.
         for f in sorted(frontiers, key=_frontier_cost):
             goal_pt = np.array([f[0], f[1]])
             if self.point_safe(goal_pt, fresh):
                 return self.reconstruct(nodes, parents, f[2])
 
-        return None   # every candidate frontier is now unsafe
+        return None   # all frontier candidates are now in unsafe cells
 
     def nearest_node(self, nodes, sx, sy) -> int:
         pts = np.asarray(nodes)
-        dx = pts[:, 0] - sx
-        dy = pts[:, 1] - sy
+        dx  = pts[:, 0] - sx
+        dy  = pts[:, 1] - sy
         return int(np.argmin(dx * dx + dy * dy))
 
     def reconstruct(self, nodes, parents, gi) -> List[np.ndarray]:
@@ -289,32 +312,35 @@ class RRTExplorer(Node):
         return path
 
     def set_path(self, path: List[np.ndarray]) -> None:
+        """Replace the current path and reset the waypoint index."""
         with self._lock:
-            self.current_path = [np.array(p, dtype=float) for p in path]
+            self.current_path   = [np.array(p, dtype=float) for p in path]
             self.waypoint_index = len(self.current_path) - 1
-            self.active_goal = self.current_path[-1].copy()
+            self.active_goal    = self.current_path[-1].copy()
             pub_path = list(self.current_path)
             pub_goal = self.active_goal.copy()
-        self._escaping = False
-        self._obstacle_since = None
+        self._escaping          = False
+        self._obstacle_since    = None
         self._escape_yaw_target = None
         self.get_logger().info(
             f"[plan] new goal=({pub_goal[0]:.2f},{pub_goal[1]:.2f}) "
             f"via {len(pub_path)} waypoints",
-            throttle_duration_sec=1.0)
+            throttle_duration_sec=1.0,
+        )
         self.publish_path(pub_path)
         self.publish_goal(pub_goal)
 
     # ====================================================================
-    # FOLLOWER  — smooth safe-LiDAR drive to goal
+    # FOLLOWER — reactive LiDAR drive
     #
-    # No two-phase TURN/DRIVE — the robot always drives forward with speed
-    # scaled by cos(heading_err) and steers proportionally toward the goal.
-    # LiDAR stops forward motion if an obstacle appears; escape spin
-    # triggers after 3 s of blocking.
+    # The robot always drives forward.  If an obstacle is detected within
+    # safe_dist, forward motion stops and the robot steers toward the
+    # clearer side (left vs right clearance comparison).
+    # RRT paths are published to RViz only and do NOT control motion.
     # ====================================================================
+
     def _forward_clearance(self) -> float:
-        """Minimum LiDAR range in the forward sector (±forward_sector degrees)."""
+        """Return the minimum LiDAR range in the forward sector (±forward_sector deg)."""
         if self.lidar is None or self.preprocessor is None:
             return float("inf")
         raw = self.lidar.get_scan()
@@ -326,9 +352,7 @@ class RRTExplorer(Node):
         )
 
     def follow_path(self) -> None:
-        # ── Pure reactive LiDAR controller ────────────────────────────────────
-        # Robot roams freely: drive forward, steer away from obstacles.
-        # RRT paths are published to RViz only — they do NOT control motion.
+        """Reactive LiDAR controller: drive forward, steer away from obstacles."""
         if self.lidar is None or self.preprocessor is None:
             self.stop_robot()
             return
@@ -337,23 +361,23 @@ class RRTExplorer(Node):
         if raw is None:
             return
 
-        scan = self.preprocessor.preprocess(raw)
-
+        scan  = self.preprocessor.preprocess(raw)
         front = self.preprocessor.get_sector_min(scan, -self.forward_sector, self.forward_sector)
 
         if front > self.safe_dist:
             vx = self.max_speed
             wz = 0.0
         else:
-            # Obstacle ahead — compare left vs right clearance and turn toward clearer side
+            # Obstacle ahead — compare left and right clearance, turn toward the opener side.
             left  = self.preprocessor.get_sector_min(scan,  self.forward_sector, 120.0)
             right = self.preprocessor.get_sector_min(scan, -120.0, -self.forward_sector)
-            vx = 0.0
-            wz = (self.max_wz if left > right else -self.max_wz) * self.yaw_sign
+            vx    = 0.0
+            wz    = (self.max_wz if left > right else -self.max_wz) * self.yaw_sign
 
         self.get_logger().info(
             f"[LIDAR] front={front:.2f}m vx={vx:.3f} wz={wz:.3f}",
-            throttle_duration_sec=1.0)
+            throttle_duration_sec=1.0,
+        )
 
         cmd = Twist()
         cmd.linear.x  = float(vx)
@@ -362,25 +386,27 @@ class RRTExplorer(Node):
         self._last_sent_wz = float(wz)
         self._cmd_pub.publish(cmd)
 
-    # ----------------------------------------------------------------------
     # ====================================================================
-    # MAP / GEOMETRY (reads conventions straight from SLAM)
+    # MAP / GEOMETRY
     # ====================================================================
+
     def get_map_snapshot(self) -> Optional[MapSnapshot]:
+        """Build an obstacle-inflated grid snapshot from the current SLAM state."""
         try:
             log_odds = np.asarray(self.slam.occupancy_grid, dtype=np.float32)
-            observed = np.asarray(self.slam.known_cells, dtype=bool)
+            observed = np.asarray(self.slam.known_cells,    dtype=bool)
         except Exception:
             return None
+
         h, w = log_odds.shape
         grid = np.full((h, w), -1, dtype=np.int16)
-        grid[observed & (log_odds > 0.5)] = 100   # requires net positive hit evidence
+        grid[observed & (log_odds >  0.5)] = 100   # net positive evidence → occupied
         grid[observed & (log_odds <= 0.5)] = 0
+
         occ = grid >= 50
 
-        # Add semantic locked doors without modifying SLAM's sensor map. Door
-        # endpoints are rasterized every snapshot, so unlock is immediate and
-        # does not leave permanent occupied cells behind.
+        # Overlay locked doors as virtual obstacles without modifying the SLAM map.
+        # Rasterised every snapshot so an unlock takes effect immediately.
         with self._lock:
             locked_doors = [
                 (left.copy(), right.copy())
@@ -388,38 +414,40 @@ class RRTExplorer(Node):
             ]
         for left, right in locked_doors:
             self._rasterize_segment(
-                occ, left, right, res=float(getattr(self.slam, "map_resolution", 0.05)),
-                ox=float(getattr(self.slam, "map_origin_x", -15.0)),
-                oy=float(getattr(self.slam, "map_origin_y", -15.0)),
+                occ, left, right,
+                res=float(getattr(self.slam, "map_resolution", 0.05)),
+                ox=float(getattr(self.slam, "map_origin_x",   -15.0)),
+                oy=float(getattr(self.slam, "map_origin_y",   -15.0)),
             )
-        inflated = self.inflate(occ, self.robot_radius_cells)
-        safe = (grid == 0) & (~inflated)
 
-        # read resolution/origin from SLAM if available (no more hardcoding)
+        inflated = self.inflate(occ, self.robot_radius_cells)
+        safe     = (grid == 0) & (~inflated)
+
         res = float(getattr(self.slam, "map_resolution", 0.05))
-        ox = float(getattr(self.slam, "map_origin_x", -15.0))
-        oy = float(getattr(self.slam, "map_origin_y", -15.0))
+        ox  = float(getattr(self.slam, "map_origin_x",  -15.0))
+        oy  = float(getattr(self.slam, "map_origin_y",  -15.0))
         return MapSnapshot(grid, safe, res, ox, oy, w, h)
 
     @staticmethod
     def _rasterize_segment(mask, a, b, res: float, ox: float, oy: float) -> None:
-        """Mark every grid cell crossed by world-space segment ``a`` -> ``b``."""
-        dx, dy = float(b[0] - a[0]), float(b[1] - a[1])
+        """Mark every grid cell crossed by the world-space segment a → b as occupied."""
+        dx, dy   = float(b[0] - a[0]), float(b[1] - a[1])
         distance = math.hypot(dx, dy)
-        steps = max(int(math.ceil(distance / max(res * 0.5, 1e-6))), 1)
+        steps    = max(int(math.ceil(distance / max(res * 0.5, 1e-6))), 1)
         height, width = mask.shape
         for i in range(steps + 1):
-            t = i / steps
+            t  = i / steps
             cx = int((float(a[0]) + t * dx - ox) / res)
             cy = int((float(a[1]) + t * dy - oy) / res)
             if 0 <= cx < width and 0 <= cy < height:
                 mask[cy, cx] = True
 
     def inflate(self, mask: np.ndarray, r: int) -> np.ndarray:
+        """Expand obstacles by r cells using a circular structuring element."""
         if r <= 0:
             return mask.copy()
-        y, x = np.ogrid[-r:r + 1, -r:r + 1]
-        struct = (x * x + y * y <= r * r)
+        y, x    = np.ogrid[-r:r + 1, -r:r + 1]
+        struct  = (x * x + y * y <= r * r)
         return binary_dilation(mask, structure=struct)
 
     def point_safe(self, p, snap: MapSnapshot) -> bool:
@@ -430,16 +458,17 @@ class RRTExplorer(Node):
         return False
 
     def line_safe(self, a, b, snap: MapSnapshot) -> bool:
+        """Return True only if every cell on the segment a → b is in free space.
+
+        Samples at half-cell resolution so diagonal segments never skip a cell.
+        """
         dx, dy = b[0] - a[0], b[1] - a[1]
-        dist = math.hypot(dx, dy)
+        dist   = math.hypot(dx, dy)
         if dist < 1e-6:
             return True
-        # Half-cell steps so diagonal segments never skip a cell.
-        # A diagonal crosses a cell every √2×res ≈ 0.07 m; sampling at res/2 = 0.025 m
-        # guarantees every cell on the line is visited at least once.
         steps = max(int(dist / (snap.resolution * 0.5)), 1)
         for k in range(steps + 1):
-            t = k / steps
+            t  = k / steps
             cx = int((a[0] + t * dx - snap.origin_x) / snap.resolution)
             cy = int((a[1] + t * dy - snap.origin_y) / snap.resolution)
             if not (0 <= cx < snap.width and 0 <= cy < snap.height) or not snap.safe[cy, cx]:
@@ -447,12 +476,13 @@ class RRTExplorer(Node):
         return True
 
     def nearest_safe(self, p, snap: MapSnapshot) -> Optional[np.ndarray]:
+        """Find the nearest free cell to p within a growing search radius."""
         cx0 = int((p[0] - snap.origin_x) / snap.resolution)
         cy0 = int((p[1] - snap.origin_y) / snap.resolution)
         if not (0 <= cx0 < snap.width and 0 <= cy0 < snap.height):
             return None
-        for r in range(1, 60):   # search up to 3 m (was 1 m) to survive SLAM drift
-            x0, x1 = max(0, cx0 - r), min(snap.width - 1, cx0 + r)
+        for r in range(1, 60):   # search up to ~3 m to survive SLAM drift
+            x0, x1 = max(0, cx0 - r), min(snap.width  - 1, cx0 + r)
             y0, y1 = max(0, cy0 - r), min(snap.height - 1, cy0 + r)
             win = snap.safe[y0:y1 + 1, x0:x1 + 1]
             if np.any(win):
@@ -460,7 +490,7 @@ class RRTExplorer(Node):
                 for ly, lx in np.argwhere(win):
                     wx = snap.origin_x + (x0 + lx + 0.5) * snap.resolution
                     wy = snap.origin_y + (y0 + ly + 0.5) * snap.resolution
-                    d = math.hypot(wx - p[0], wy - p[1])
+                    d  = math.hypot(wx - p[0], wy - p[1])
                     if d < best_d:
                         best_d, best_p = d, np.array([wx, wy])
                 return best_p
@@ -476,20 +506,18 @@ class RRTExplorer(Node):
         return None
 
     def block_door_in_costmap(self, left, right, door_id: int = 0) -> None:
-        """Insert a detected locked doorway as a persistent virtual obstacle."""
-        left_arr = np.asarray(left, dtype=float)[:2]
+        """Add a locked doorway as a persistent virtual obstacle in the costmap."""
+        left_arr  = np.asarray(left,  dtype=float)[:2]
         right_arr = np.asarray(right, dtype=float)[:2]
         with self._lock:
             self._locked_doors[int(door_id)] = (left_arr, right_arr)
             self._navigation_revision += 1
-            # Cancel a frontier path that may have been planned through it.
+            # Cancel any frontier path that may have been planned through this door.
             if self._priority_goal is None:
                 self.current_path = []
-                self.active_goal = None
+                self.active_goal  = None
                 self._need_replan = True
-        self.get_logger().info(
-            f"[door {door_id}] LOCKED: added to semantic costmap"
-        )
+        self.get_logger().info(f"[door {door_id}] LOCKED: added to semantic costmap")
 
     def unblock_door(self, left=None, right=None, door_id: int = 0) -> None:
         """Remove a doorway's virtual obstacle after its key is collected."""
@@ -497,28 +525,26 @@ class RRTExplorer(Node):
             self._locked_doors.pop(int(door_id), None)
             self._navigation_revision += 1
             self.current_path = []
-            self.active_goal = None
+            self.active_goal  = None
             self._need_replan = True
-        self.get_logger().info(
-            f"[door {door_id}] UNLOCKED: removed from semantic costmap"
-        )
+        self.get_logger().info(f"[door {door_id}] UNLOCKED: removed from semantic costmap")
 
     def navigate_to_door(self, door_id: int, center) -> None:
-        """Pre-empt exploration and revisit an unlocked door immediately."""
-        goal = np.asarray(center, dtype=float)[:2]
+        """Pre-empt frontier exploration to revisit an unlocked door immediately."""
+        goal  = np.asarray(center, dtype=float)[:2]
         label = f"door {door_id}"
         start_now = False
         with self._lock:
             self.exploration_complete = False
-            labels = [queued_label for queued_label, _ in self._priority_queue]
-            if self._priority_label == label or label in labels:
-                return
+            queued_labels = [lbl for lbl, _ in self._priority_queue]
+            if self._priority_label == label or label in queued_labels:
+                return   # already queued or active
             if self._priority_goal is None:
-                self._priority_goal = goal
-                self._priority_label = label
-                self.current_path = []
-                self.active_goal = None
-                self._need_replan = False
+                self._priority_goal   = goal
+                self._priority_label  = label
+                self.current_path     = []
+                self.active_goal      = None
+                self._need_replan     = False
                 self._navigation_revision += 1
                 start_now = True
             else:
@@ -538,11 +564,12 @@ class RRTExplorer(Node):
         self._cmd_pub.publish(Twist())
 
     # ====================================================================
-    # VIZ
+    # VISUALISATION
     # ====================================================================
+
     def publish_path(self, path) -> None:
         msg = Path()
-        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.stamp    = self.get_clock().now().to_msg()
         msg.header.frame_id = "map"
         for p in path:
             ps = PoseStamped()
@@ -555,7 +582,7 @@ class RRTExplorer(Node):
 
     def publish_goal(self, goal) -> None:
         m = Marker()
-        m.header.stamp = self.get_clock().now().to_msg()
+        m.header.stamp    = self.get_clock().now().to_msg()
         m.header.frame_id = "map"
         m.ns = "rrt_frontier_goal"
         m.id = 0
@@ -564,11 +591,11 @@ class RRTExplorer(Node):
             self.goal_pub.publish(m)
             return
         m.action = Marker.ADD
-        m.type = Marker.SPHERE
+        m.type   = Marker.SPHERE
         m.pose.position.x = float(goal[0])
         m.pose.position.y = float(goal[1])
         m.pose.position.z = 0.05
-        m.pose.orientation.w = 1.0
+        m.pose.orientation.w  = 1.0
         m.scale.x = m.scale.y = m.scale.z = 0.25
         m.color.r, m.color.g, m.color.b, m.color.a = 0.1, 0.8, 1.0, 1.0
         self.goal_pub.publish(m)

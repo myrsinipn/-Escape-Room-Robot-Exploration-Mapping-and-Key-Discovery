@@ -5,15 +5,14 @@ import numpy as np
 
 
 class ArucoDetector:
-    """
-    ArUco marker detector.
+    """Detects ArUco markers in a camera frame and estimates their 3-D poses.
 
-    Responsibilities:
-    - Detect ArUco markers
-    - Estimate marker poses
-    - Return clean semantic detections
-
-
+    For each detected marker the detector returns:
+      - marker_id  : integer ID encoded in the marker pattern
+      - corners    : 2-D pixel corners of the marker in the image
+      - rvec       : rotation vector (Rodrigues) from camera to marker frame
+      - tvec       : translation vector (metres) from camera to marker centre
+      - T_cm       : 4×4 homogeneous transform from marker frame to camera frame
     """
 
     def __init__(
@@ -27,75 +26,35 @@ class ArucoDetector:
         Parameters
         ----------
         camera_matrix : np.ndarray
-            Camera intrinsic matrix.
-
+            3×3 camera intrinsic matrix (from calibration).
         distortion_coeffs : np.ndarray
-            Camera distortion coefficients.
-
+            Distortion coefficients (from calibration).
         marker_size : float
-            Marker size in meters.
-
+            Physical side length of the marker in metres.
         dictionary_name : int
-            OpenCV ArUco dictionary.
+            OpenCV ArUco dictionary constant (default: DICT_4X4_50).
         """
-
-        self.camera_matrix = camera_matrix
+        self.camera_matrix    = camera_matrix
         self.distortion_coeffs = distortion_coeffs
+        self.marker_size      = marker_size
 
-        self.marker_size = marker_size
+        self.dictionary       = cv2.aruco.getPredefinedDictionary(dictionary_name)
+        self.detector_params  = cv2.aruco.DetectorParameters()
+        self.detector         = cv2.aruco.ArucoDetector(self.dictionary, self.detector_params)
 
-        # aruco dictionary
-        self.dictionary = cv2.aruco.getPredefinedDictionary(
-            dictionary_name
-        )
+    def detect(self, frame: np.ndarray) -> List[Dict[str, Any]]:
+        """Detect all ArUco markers in ``frame`` and estimate their poses.
 
-        # detector parameters
-        self.detector_params = (
-            cv2.aruco.DetectorParameters()
-        )
-
-        # detector object
-        self.detector = cv2.aruco.ArucoDetector(
-            self.dictionary,
-            self.detector_params,
-        )
-
-    def detect(
-        self,
-        frame: np.ndarray,
-    ) -> List[Dict[str, Any]]:
+        Returns a list of detection dicts (one per marker); empty if none found.
         """
-        Detect ArUco markers in image.
-
-        Returns:
-        [
-            {
-                "marker_id": int,
-                "corners": np.ndarray,
-                "rvec": np.ndarray,
-                "tvec": np.ndarray,
-                "T_cm": np.ndarray,
-            }
-        ]
-        """
-
         detections = []
 
-        # grayscale image
-        gray = cv2.cvtColor(
-            frame,
-            cv2.COLOR_BGR2GRAY,
-        )
-
-        # detect markers
-        corners, ids, _ = self.detector.detectMarkers(
-            gray
-        )
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        corners, ids, _ = self.detector.detectMarkers(gray)
 
         if ids is None:
             return detections
 
-        # estimate pose
         rvecs, tvecs, _ = cv2.aruco.estimatePoseSingleMarkers(
             corners,
             self.marker_size,
@@ -104,22 +63,15 @@ class ArucoDetector:
         )
 
         for i, marker_id in enumerate(ids.flatten()):
-
             rvec = rvecs[i].flatten()
             tvec = tvecs[i].flatten()
-
-            T_cm = self.create_transformation_matrix(
-                rvec,
-                tvec,
-            )
-
             detections.append(
                 {
                     "marker_id": int(marker_id),
-                    "corners": corners[i],
-                    "rvec": rvec,
-                    "tvec": tvec,
-                    "T_cm": T_cm,
+                    "corners":   corners[i],
+                    "rvec":      rvec,
+                    "tvec":      tvec,
+                    "T_cm":      self.create_transformation_matrix(rvec, tvec),
                 }
             )
 
@@ -130,20 +82,11 @@ class ArucoDetector:
         rvec: np.ndarray,
         tvec: np.ndarray,
     ) -> np.ndarray:
-        """
-        Creates homogeneous transformation matrix.
-
-        T_cm:
-        transform from marker frame -> camera frame
-        """
-
+        """Build the 4×4 homogeneous transform T_cm (marker frame → camera frame)."""
         R_cm, _ = cv2.Rodrigues(rvec)
-
         T_cm = np.eye(4)
-
         T_cm[:3, :3] = R_cm
-        T_cm[:3, 3] = tvec
-
+        T_cm[:3, 3]  = tvec
         return T_cm
 
     def draw_detections(
@@ -151,27 +94,15 @@ class ArucoDetector:
         frame: np.ndarray,
         detections: List[Dict[str, Any]],
     ) -> np.ndarray:
-        """
-        Draw markers and axes on frame.
-        """
-
+        """Overlay marker borders and coordinate axes on a copy of ``frame``."""
         output = frame.copy()
-
         for detection in detections:
-
-            corners = detection["corners"]
-            rvec = detection["rvec"]
-            tvec = detection["tvec"]
+            corners   = detection["corners"]
+            rvec      = detection["rvec"]
+            tvec      = detection["tvec"]
             marker_id = detection["marker_id"]
 
-            # draw marker borders
-            cv2.aruco.drawDetectedMarkers(
-                output,
-                [corners],
-                np.array([[marker_id]]),
-            )
-
-            # draw coordinate axes
+            cv2.aruco.drawDetectedMarkers(output, [corners], np.array([[marker_id]]))
             cv2.drawFrameAxes(
                 output,
                 self.camera_matrix,

@@ -68,7 +68,7 @@ class OdometrySensor(Node):
         qz = msg.pose.pose.orientation.z
         qw = msg.pose.pose.orientation.w
 
-        # quaternion -> euler
+        # quaternion to euler
         _, _, yaw = euler_from_quaternion(
             [qx, qy, qz, qw]
         )
