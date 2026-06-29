@@ -1,13 +1,10 @@
 #!/usr/bin/env python3
 """
-Main entry point — B07 Escape Room Robot.
+Main entry point — B07 Escape Room Robot (Presentation Demo 2).
 
-PRESENTATION MODE
------------------
-The RRTExplorer runs its planner only: it builds RRT paths and publishes them
-to /exploration_path and /rrt_goal for RViz visualisation.
-All motion control (follow_path / _ctrl_cb) is disabled inside rrt_exploration.py.
-Physical robot motion is handled by SafeLidarMotion (reactive LiDAR obstacle avoidance).
+Uses rrt_explorer2.py ("my rrt", commit 9686606):
+  - Full RRT path planning + two-phase waypoint follower (TURN → DRIVE).
+  - The explorer drives the robot directly via /cmd_vel (no SafeLidarMotion).
 """
 import json
 import os
@@ -17,7 +14,7 @@ import rclpy
 from rclpy.executors import MultiThreadedExecutor
 from geometry_msgs.msg import Twist
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-from mapping.rrt_exploration1 import RRTExplorer
+from mapping.rrt_explorer2 import RRTExplorer
 from sensors.lidar    import LidarSensor
 from sensors.camera   import CameraSensor
 from sensors.odometry import OdometrySensor
@@ -25,7 +22,6 @@ from perception.scan_preprocessor import ScanPreprocessor
 from perception.aruco_detector     import ArucoDetector
 from perception.motion_model       import OmniMotionModel
 from control.aruco_monitor     import ArucoMonitor
-from control.safe_lidar_motion import SafeLidarMotion
 from state_estimation.ekf_slam import EKFLidarSLAM
 
 
@@ -42,12 +38,12 @@ def load_calibration(path: str, camera_id: str = "11"):
 def main() -> None:
     rclpy.init()
 
-    # Sensors 
+    # ── Sensors ───────────────────────────────────────────────────────
     lidar  = LidarSensor(topic_name="/scan",    min_range=0.10, max_range=8.0)
     camera = CameraSensor(topic_name="/image_raw")
     odom   = OdometrySensor(topic_name="/odom", qos_profile=30)
 
-    # Shared helpers (plain objects, not nodes) 
+    # ── Shared helpers (plain objects, not nodes) ──────────────────────
     preprocessor = ScanPreprocessor(
         min_range=0.10,
         max_range=8.0,
@@ -56,7 +52,7 @@ def main() -> None:
     )
     motion_model = OmniMotionModel()
 
-    # Nodes
+    # ── Nodes ─────────────────────────────────────────────────────────
     calib_path = os.path.join(
         os.path.dirname(__file__),
         "config",
@@ -77,14 +73,14 @@ def main() -> None:
         motion_model=motion_model,
     )
 
-    # Explorer  
+    # ── Explorer ──────
     rrt = RRTExplorer(
         slam=slam,
         lidar=lidar,
         preprocessor=preprocessor,
         slam_map_topic="/slam_map"
     )
-    
+
     aruco_monitor = ArucoMonitor(
         camera=camera,
         aruco=aruco,
@@ -95,13 +91,10 @@ def main() -> None:
         ),
     )
 
-    # SafeLidarMotion owns /cmd_vel  it drives the robot reactively.
-    safe_motion = SafeLidarMotion(lidar=lidar, preprocessor=preprocessor)
-
     # Stop motors at startup.
-    safe_motion.cmd_pub.publish(Twist())
+    rrt._cmd_pub.publish(Twist())
 
-    #  Executor         
+    # ── Executor ──────────────────────────────────────────────────────
     executor = MultiThreadedExecutor()
     for node in [
         lidar,
@@ -110,7 +103,6 @@ def main() -> None:
         aruco_monitor,
         slam,
         rrt,
-        safe_motion,
     ]:
         executor.add_node(node)
 
@@ -122,12 +114,10 @@ def main() -> None:
         aruco_monitor.print_summary()
         # slam.print_debug_summary()
 
-        # Stop motors on shutdown.
-        safe_motion.cmd_pub.publish(Twist())
+        rrt._cmd_pub.publish(Twist())
 
         for node in [
             rrt,
-            safe_motion,
             slam,
             aruco_monitor,
             odom,
