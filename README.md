@@ -178,17 +178,78 @@ python3 main2.py       # full autonomous mode (RRTExplorer owns cmd_vel directly
 
 ## Visualising on the laptop
 
-Build and source the URDF description package, then open RViz:
+Start these terminals in order — robot terminals first, then laptop terminals.
+
+### Robot — Terminal 2 (TF bridge)
+
+Run this after `run_robot_all.sh` and `main.py` are up:
 
 ```bash
-cd laptop
-colcon build --packages-select myagv_plus_description
-source install/setup.bash
+source /opt/ros/galactic/setup.bash
 export ROS_DOMAIN_ID=7
-ros2 launch myagv_plus_description <your_launch_file>.launch.py
+python3 ~/ros2_ws/src/slam_pose_to_tf.py
 ```
 
-Key RViz topics:
+This re-publishes the SLAM pose as a `/tf` transform so RViz can place the robot model correctly.
+
+---
+
+### Laptop — Terminal 1 (robot_state_publisher)
+
+Converts the URDF into live joint-state transforms:
+
+```bash
+cd ~/ros2_ws
+source /opt/ros/humble/setup.bash
+source install/setup.bash
+export ROS_DOMAIN_ID=7
+xacro ~/ros2_ws/install/myagv_plus_description/share/myagv_plus_description/urdf/myagv_plus.urdf.xacro \
+  > /tmp/myagv_plus.urdf
+ros2 run robot_state_publisher robot_state_publisher \
+  --ros-args -p robot_description:="$(cat /tmp/myagv_plus.urdf)"
+```
+
+### Laptop — Terminal 2 (RViz via Docker)
+
+```bash
+cd ~/ros2_ws
+source /opt/ros/humble/setup.bash
+source install/setup.bash
+export ROS_DOMAIN_ID=7
+
+xhost +local:docker
+
+docker run --rm -it \
+  --network=host \
+  --env DISPLAY=$DISPLAY \
+  --volume /tmp/.X11-unix:/tmp/.X11-unix \
+  --volume /tmp:/tmp \
+  --volume $HOME/ros2_ws:/root/ros2_ws \
+  -e ROS_DOMAIN_ID=7 \
+  osrf/ros:galactic-desktop \
+  bash -c "source /opt/ros/galactic/setup.bash && \
+           source /root/ros2_ws/install/setup.bash && \
+           rviz2"
+```
+
+Inside RViz: add a **RobotModel** display and set **Description File** to `/tmp/myagv_plus.urdf`.
+
+### Laptop — Terminal 3 (wheel animator)
+
+Publishes animated wheel joint states so the URDF model shows the wheels spinning:
+
+```bash
+cd ~/ros2_ws
+source /opt/ros/humble/setup.bash
+source install/setup.bash
+export ROS_DOMAIN_ID=7
+export ROS_LOCALHOST_ONLY=0
+python3 ~/ros2_ws/src/slam_wheel_animator.py
+```
+
+---
+
+### Key RViz topics
 
 | Topic | Type | Content |
 |-------|------|---------|

@@ -1,0 +1,14 @@
+# Core numerical / scientific
+numpy
+scipy
+
+# Computer vision (ArUco detection)
+opencv-contrib-python
+
+# ROS 2 Python client library and utilities
+# Install via apt, not pip:
+#   sudo apt install ros-galactic-rclpy
+#   sudo apt install ros-galactic-cv-bridge
+#   sudo apt install ros-galactic-tf-transformations
+#   sudo apt install ros-galactic-v4l2-camera
+#   sudo apt install ros-galactic-robot-state-publisher
