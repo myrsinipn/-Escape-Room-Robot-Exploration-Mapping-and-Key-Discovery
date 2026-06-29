@@ -61,7 +61,7 @@ class RRTExplorer(Node):
         step_size: float = 0.50,
         max_iterations: int = 600,
         robot_radius_cells: int = 3,
-        min_known_cells: int = 800,
+        min_known_cells: int = 600,
         min_plan_interval: float = 2.0,
         slam_map_topic: str = "/slam_map",   # accepted for compatibility; unused
         cmd_vel_topic: str = "/cmd_vel",
@@ -86,17 +86,19 @@ class RRTExplorer(Node):
         self.wp_tol = 0.10
         self.goal_tolerance = 0.40
 
-        self.max_speed = 0.05            # m/s (was 0.07 — slower, more controllable)
+        self.max_speed = 0.05
         self.k_v = 0.6
-        self.k_yaw = 0.5                 # gentler turn rate
-        self.max_wz = 0.25               # rad/s (was 0.35)
-        self.close_wz = 0.15             # rad/s (was 0.20)
-        self.turn_thresh = 0.26          # rad (~15 deg): above this -> rotate in place
-        self.align_thresh = 0.10         # rad (~6 deg): below this -> resume driving
+        self.k_yaw = 0.8
+        self.max_wz = 0.40
+        self.close_wz = 0.25
+        self.turn_thresh = 0.35     # rad (~20 deg): spin in place above this
+        self.align_thresh = 0.17    # rad (~10 deg): resume driving below this
+        self.turn_timeout = 8.0
         self.turning = False
+        self._turning_since: float = 0.0
 
         # >>> If the robot spins in place forever, set this to -1.0 <<<
-        self.yaw_sign = 1.0
+        self.yaw_sign = -1.0
 
         # ---- backup recovery ----
         self.backup_dist = 0.15
@@ -121,11 +123,30 @@ class RRTExplorer(Node):
         self.path_pub = self.create_publisher(Path, "/exploration_path", 1)
         self.goal_pub = self.create_publisher(Marker, "/rrt_goal", 1)
 
+        # Diagnostic: log when cmd_vel arrives from outside (aruco_monitor override)
+        self._last_sent_wz: float = 0.0
+        self._last_sent_vx: float = 0.0
+        self.create_subscription(
+            Twist, cmd_vel_topic, self._cmdvel_spy_cb, 10,
+            callback_group=self.cb_group)
+
         # ---- timers ----
         self.create_timer(self.planner_period, self._plan_cb, callback_group=self.cb_group)
         self.create_timer(self.control_period, self._ctrl_cb, callback_group=self.cb_group)
 
         self.get_logger().info("RRT frontier explorer initialized (minimal).")
+
+    def _cmdvel_spy_cb(self, msg: Twist) -> None:
+        """Detects if an external node is overriding our cmd_vel."""
+        vx = round(msg.linear.x, 3)
+        wz = round(msg.angular.z, 3)
+        exp_vx = round(self._last_sent_vx, 3)
+        exp_wz = round(self._last_sent_wz, 3)
+        if vx != exp_vx or wz != exp_wz:
+            self.get_logger().warn(
+                f"[OVERRIDE] cmd_vel got vx={vx} wz={wz} "
+                f"but explorer last sent vx={exp_vx} wz={exp_wz}",
+                throttle_duration_sec=1.0)
 
     # ====================================================================
     # TIMERS
@@ -328,6 +349,9 @@ class RRTExplorer(Node):
             self.active_goal = self.current_path[-1].copy()
             pub_path = list(self.current_path)
             pub_goal = self.active_goal.copy()
+        # always reset turn latch when a new path arrives
+        self.turning = False
+        self._turning_since = 0.0
         self.get_logger().info(
             f"[plan] new goal=({pub_goal[0]:.2f},{pub_goal[1]:.2f}) "
             f"waypoints={len(pub_path)}",
@@ -409,19 +433,28 @@ class RRTExplorer(Node):
         tx, ty = float(path[wp][0]), float(path[wp][1])
         dist = math.hypot(tx - rx, ty - ry)
         yaw_err = wrap_angle(math.atan2(ty - ry, tx - rx) - rth)
+        now = self.get_clock().now().nanoseconds * 1e-9
 
         self.get_logger().info(
             f"[follow] wp={wp}/{len(path)} dist={dist:.2f} "
-            f"yaw_err={math.degrees(yaw_err):.0f}deg",
+            f"yaw_err={math.degrees(yaw_err):.0f}deg "
+            f"turning={self.turning}",
             throttle_duration_sec=1.0)
 
-        # Turn-in-place hysteresis: rotate first, then drive. No forward motion
-        # while a large heading error remains, otherwise the robot orbits.
+        # Turn-in-place hysteresis with timeout escape.
+        # Large heading error -> rotate in place (no forward motion).
+        # If still turning after turn_timeout seconds, force drive anyway
+        # so the robot never gets permanently stuck in a turn-only state.
         if self.turning:
             if abs(yaw_err) < self.align_thresh:
                 self.turning = False
+            elif now - self._turning_since > self.turn_timeout:
+                self.get_logger().warn(
+                    f"Turn timeout ({self.turn_timeout}s) exceeded — forcing drive.")
+                self.turning = False
         elif abs(yaw_err) > self.turn_thresh:
             self.turning = True
+            self._turning_since = now
 
         cmd = Twist()
         if self.turning:
@@ -431,6 +464,8 @@ class RRTExplorer(Node):
             cmd.linear.x = min(self.max_speed, self.k_v * dist)
             cmd.angular.z = clamp(self.yaw_sign * self.k_yaw * yaw_err,
                                   -self.close_wz, self.close_wz)
+        self._last_sent_vx = cmd.linear.x
+        self._last_sent_wz = cmd.angular.z
         self._cmd_pub.publish(cmd)
 
     def start_backup(self, rx: float, ry: float) -> None:
@@ -550,7 +585,17 @@ class RRTExplorer(Node):
             pass
         return None
 
+    def block_door_in_costmap(self, left, right) -> None:
+        """Stub: door blocking not implemented in this explorer version."""
+        self.get_logger().info(f"[door] block requested: {left} / {right} (stub)")
+
+    def unblock_door(self, left, right) -> None:
+        """Stub: door unblocking not implemented in this explorer version."""
+        self.get_logger().info(f"[door] unblock requested: {left} / {right} (stub)")
+
     def stop_robot(self) -> None:
+        self._last_sent_vx = 0.0
+        self._last_sent_wz = 0.0
         self._cmd_pub.publish(Twist())
 
     # ====================================================================
