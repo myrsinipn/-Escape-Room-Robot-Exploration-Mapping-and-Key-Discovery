@@ -81,7 +81,7 @@ The robot operates a continuous sense–plan–act loop:
 |-----------|-------|
 | Robot base | ElephantRobotics myAGV Plus (omnidirectional) |
 | LiDAR | YDLiDAR X2 |
-| Camera | USB camera (`/dev/video0`) |
+| Camera | v4l2_camera |
 | On-board computer | Raspberry Pi (runs ROS 1 Noetic + ROS 2 Galactic) |
 
 ---
@@ -291,7 +291,6 @@ python3 ~/ros2_ws/src/slam_wheel_animator.py
 
 | Symptom | Likely cause | Fix |
 |---------|-------------|-----|
-| Robot spins in place indefinitely | Yaw sign mismatch between odometry and `cmd_vel` | Flip `self.yaw_sign` in `rrt_exploration.py` from `+1.0` to `-1.0` |
 | Map smears during rotation | Spin-guard threshold not matched to actual angular velocity | Tune the angular velocity threshold in `ekf_slam.py` |
 | ArUco markers never confirmed | `confirmation_frames` too high, or camera frame rate too low | Lower `confirmation_frames` in `key_doors.json` |
 | Bridge topics not forwarding | `ROS_DOMAIN_ID` mismatch | Set the same domain ID (default `7`) in **all** terminals |
