@@ -1,0 +1,543 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>RRT Exploration — Presentation Slides</title>
+  <style>
+    /* ── Global ── */
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: "Segoe UI", Arial, sans-serif;
+      background: #e8edf2;
+      padding: 40px 20px;
+      color: #1a1a2e;
+    }
+
+    /* ── Slide container ── */
+    .slide {
+      background: #fff;
+      width: 900px;
+      margin: 0 auto 50px auto;
+      border-radius: 4px;
+      box-shadow: 0 4px 18px rgba(0,0,0,0.13);
+      overflow: hidden;
+      page-break-after: always;
+    }
+
+    /* ── Header band ── */
+    .slide-header {
+      background: #5b7fa6;
+      color: #fff;
+      padding: 18px 36px;
+      font-size: 1.25rem;
+      font-weight: 600;
+      letter-spacing: 0.02em;
+    }
+
+    /* ── Body ── */
+    .slide-body {
+      padding: 34px 44px 38px 44px;
+    }
+
+    /* ── Section title inside body ── */
+    h2 {
+      font-size: 1.05rem;
+      font-weight: 700;
+      margin-bottom: 18px;
+      color: #1a1a2e;
+    }
+
+    p {
+      font-size: 0.94rem;
+      line-height: 1.65;
+      color: #2c2c2c;
+      margin-bottom: 12px;
+    }
+
+    /* ── Algorithm block ── */
+    .algo {
+      font-family: "Courier New", monospace;
+      font-size: 0.91rem;
+      line-height: 2.0;
+      color: #1a1a2e;
+    }
+
+    .algo-line {
+      display: flex;
+      align-items: baseline;
+      gap: 12px;
+    }
+
+    .algo-num {
+      color: #5b7fa6;
+      min-width: 26px;
+      text-align: right;
+      font-weight: 700;
+      font-size: 0.88rem;
+      flex-shrink: 0;
+    }
+
+    .algo-text {
+      color: #1a1a2e;
+    }
+
+    .algo-keyword {
+      font-weight: 700;
+      font-style: italic;
+    }
+
+    .algo-math {
+      font-style: italic;
+    }
+
+    sub-indent {
+      display: block;
+      padding-left: 28px;
+    }
+
+    /* ── Note/callout box ── */
+    .note {
+      background: #f0f4f9;
+      border-left: 4px solid #5b7fa6;
+      border-radius: 2px;
+      padding: 12px 16px;
+      font-size: 0.88rem;
+      color: #333;
+      margin-top: 18px;
+      line-height: 1.6;
+    }
+
+    /* ── Two-column layout ── */
+    .two-col {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 28px;
+      margin-top: 6px;
+    }
+
+    /* ── Demo box ── */
+    .demo-box {
+      border: 1.5px solid #c5d4e8;
+      border-radius: 6px;
+      overflow: hidden;
+    }
+
+    .demo-box-header {
+      background: #5b7fa6;
+      color: #fff;
+      font-size: 0.88rem;
+      font-weight: 700;
+      padding: 9px 14px;
+      letter-spacing: 0.03em;
+    }
+
+    .demo-box-header.alt {
+      background: #3e6b9e;
+    }
+
+    .demo-box-body {
+      padding: 14px 16px;
+      font-size: 0.87rem;
+      line-height: 1.6;
+      color: #2c2c2c;
+    }
+
+    .demo-box-body ul {
+      margin-left: 16px;
+      margin-top: 4px;
+    }
+
+    .demo-box-body ul li {
+      margin-bottom: 5px;
+    }
+
+    /* ── Highlight text ── */
+    .hl { color: #2a5ea7; font-weight: 600; }
+    .hl-warn { color: #b94a00; font-weight: 600; }
+
+    /* ── Bullet list ── */
+    ul.body-list {
+      margin-left: 20px;
+      margin-top: 6px;
+      font-size: 0.93rem;
+      line-height: 1.7;
+      color: #2c2c2c;
+    }
+
+    ul.body-list li { margin-bottom: 6px; }
+
+    /* ── Divider ── */
+    hr {
+      border: none;
+      border-top: 1px solid #dce4ef;
+      margin: 22px 0;
+    }
+
+    /* ── Flow diagram (text-based) ── */
+    .flow {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+      margin: 14px 0;
+      font-size: 0.85rem;
+    }
+
+    .flow-box {
+      background: #eef2f8;
+      border: 1px solid #b0c4de;
+      border-radius: 4px;
+      padding: 7px 12px;
+      text-align: center;
+      font-weight: 600;
+      min-width: 110px;
+      line-height: 1.35;
+    }
+
+    .flow-box.green  { background: #e8f5e9; border-color: #81c784; }
+    .flow-box.orange { background: #fff3e0; border-color: #ffb74d; }
+    .flow-box.red    { background: #fdecea; border-color: #e57373; }
+    .flow-box.blue   { background: #e3f0ff; border-color: #64a0d4; }
+
+    .arrow {
+      font-size: 1.1rem;
+      color: #5b7fa6;
+      font-weight: 700;
+    }
+
+    /* ── Print ── */
+    @media print {
+      body { background: white; padding: 0; }
+      .slide { box-shadow: none; margin-bottom: 0; page-break-after: always; }
+    }
+  </style>
+</head>
+<body>
+
+<!-- ══════════════════════════════════════════════════════ -->
+<!-- SLIDE 1 — RRT Algorithm                               -->
+<!-- ══════════════════════════════════════════════════════ -->
+<div class="slide">
+  <div class="slide-header">Rapidly Exploring Random Trees (RRT)</div>
+  <div class="slide-body">
+
+    <h2>RRT Algorithm:</h2>
+
+    <div class="algo">
+      <div class="algo-line">
+        <span class="algo-num">1</span>
+        <span class="algo-text">Initialize search tree with <span class="algo-math">x</span><sub>start</sub></span>
+      </div>
+      <div class="algo-line">
+        <span class="algo-num">2</span>
+        <span class="algo-text"><span class="algo-keyword">while</span> <em>stopping criterion is not met</em></span>
+      </div>
+      <div class="algo-line" style="padding-left: 28px;">
+        <span class="algo-num">3</span>
+        <span class="algo-text">sample <span class="algo-math">x</span><sub>sample</sub> &#x223C; <span class="algo-math">&#x1D4B3;</span> &nbsp;&nbsp;<span style="font-family:sans-serif; font-size:0.82rem; color:#5b5b5b;">(uniform random point in free space, or biased toward known frontiers)</span></span>
+      </div>
+      <div class="algo-line" style="padding-left: 28px;">
+        <span class="algo-num">4</span>
+        <span class="algo-text">find <span class="algo-math">x</span><sub>nearest</sub> &mdash; closest node in tree to <span class="algo-math">x</span><sub>sample</sub></span>
+      </div>
+      <div class="algo-line" style="padding-left: 28px;">
+        <span class="algo-num">5</span>
+        <span class="algo-text">steer from <span class="algo-math">x</span><sub>nearest</sub> toward <span class="algo-math">x</span><sub>sample</sub> by step size &delta; &rarr; obtain <span class="algo-math">x</span><sub>new</sub></span>
+      </div>
+      <div class="algo-line" style="padding-left: 28px;">
+        <span class="algo-num">6</span>
+        <span class="algo-text"><span class="algo-keyword">if</span> <span class="algo-math">x</span><sub>new</sub> and the edge <span class="algo-math">x</span><sub>nearest</sub>&ndash;<span class="algo-math">x</span><sub>new</sub> are collision-free</span>
+      </div>
+      <div class="algo-line" style="padding-left: 56px;">
+        <span class="algo-num">7</span>
+        <span class="algo-text">add <span class="algo-math">x</span><sub>new</sub> to tree with edge from <span class="algo-math">x</span><sub>nearest</sub></span>
+      </div>
+      <div class="algo-line" style="padding-left: 56px;">
+        <span class="algo-num">8</span>
+        <span class="algo-text"><span class="algo-keyword">if</span> <span class="algo-math">x</span><sub>new</sub> &#x2208; <span class="algo-math">&#x1D4B3;</span><sub>goal</sub> &nbsp;<span class="algo-keyword">return</span> SUCCESS</span>
+      </div>
+      <div class="algo-line">
+        <span class="algo-num">9</span>
+        <span class="algo-text"><span class="algo-keyword">return</span> FAILURE</span>
+      </div>
+    </div>
+
+    <div class="note">
+      <strong>In our implementation:</strong> &nbsp; &delta; = 0.50 m &nbsp;|&nbsp;
+      max iterations = 1000 &nbsp;|&nbsp;
+      robot inflation radius = 5 cells (= 0.25 m clearance) &nbsp;|&nbsp;
+      30% of samples are biased toward already-detected frontier cells to accelerate convergence.
+      The <em>goal region</em> is not a fixed target but the nearest <strong>frontier</strong> —
+      the boundary between observed free space and unknown space in the SLAM occupancy grid.
+    </div>
+
+  </div>
+</div>
+
+
+<!-- ══════════════════════════════════════════════════════ -->
+<!-- SLIDE 2 — How RRT is used for frontier exploration    -->
+<!-- ══════════════════════════════════════════════════════ -->
+<div class="slide">
+  <div class="slide-header">RRT for Frontier-Based Exploration</div>
+  <div class="slide-body">
+
+    <h2>From path planning to autonomous exploration</h2>
+
+    <p>
+      Standard RRT finds a path from a fixed start to a known goal.
+      In our escape-room scenario, there is no pre-defined goal — the robot must
+      <em>discover</em> the room by itself. We adapt RRT to do this by replacing the
+      fixed goal region with <strong>frontier cells</strong>: grid cells that sit on the
+      boundary between observed free space and unexplored (unknown) space.
+    </p>
+
+    <div class="flow">
+      <div class="flow-box blue">SLAM map<br/><small>(occupancy grid)</small></div>
+      <span class="arrow">&#8594;</span>
+      <div class="flow-box blue">Detect frontiers<br/><small>(free ↔ unknown edges)</small></div>
+      <span class="arrow">&#8594;</span>
+      <div class="flow-box blue">Run RRT<br/><small>(start → best frontier)</small></div>
+      <span class="arrow">&#8594;</span>
+      <div class="flow-box green">Publish path<br/>to RViz</div>
+    </div>
+
+    <p style="margin-top:4px;">
+      Every <strong>3 seconds</strong> the planner timer fires, takes a snapshot of the
+      current SLAM occupancy grid, inflates obstacles by the robot radius,
+      runs RRT from the robot's estimated position, and selects the frontier
+      that scores best on a combined distance + heading-alignment cost.
+      The resulting path is published on <code>/exploration_path</code> and the
+      goal marker on <code>/rrt_goal</code> — both visible in RViz.
+    </p>
+
+    <hr/>
+
+    <h2>Frontier scoring</h2>
+    <ul class="body-list">
+      <li>Frontiers too close (&lt; 0.75 m) are rejected — they may be inside the inflation buffer.</li>
+      <li>Frontiers too far (&gt; 1.35 m) are rejected — they may not be reachable in a single RRT run.</li>
+      <li>Among the remaining candidates the cost is: &nbsp;
+        <code>|dist &minus; 1.0&nbsp;m| &nbsp;+&nbsp; (turn_angle / &pi;) &times; 0.25</code>
+        &nbsp; so the planner slightly prefers frontiers roughly ahead of the robot.
+      </li>
+      <li>Before accepting the best frontier, the path is re-checked against a <em>fresh</em>
+        map snapshot to discard any goal that has since become occupied.</li>
+    </ul>
+
+  </div>
+</div>
+
+
+<!-- ══════════════════════════════════════════════════════ -->
+<!-- SLIDE 3 — Why two demos / two mains                   -->
+<!-- ══════════════════════════════════════════════════════ -->
+<div class="slide">
+  <div class="slide-header">Live Demo — Two Configurations Explained</div>
+  <div class="slide-body">
+
+    <h2>Why we run two separate programs</h2>
+
+    <p>
+      Getting a robot to follow RRT paths reliably in a real room requires
+      that <em>every</em> layer in the stack works well at the same time:
+      the SLAM pose must be accurate, odometry must not drift, the occupancy grid
+      must reflect real walls, and the path follower must track curved waypoint
+      sequences without overshooting or orbiting. In our current state of
+      development not all of these are simultaneously reliable — so we split
+      the demo into two focused parts to show what is working.
+    </p>
+
+    <hr/>
+
+    <div class="two-col">
+
+      <!-- main.py -->
+      <div class="demo-box">
+        <div class="demo-box-header">Demo 1 &nbsp;—&nbsp; <code>main.py</code></div>
+        <div class="demo-box-body">
+          <p style="margin-bottom:10px;">
+            <span class="hl">RRT planning &amp; visualisation + Safe LiDAR motion</span>
+          </p>
+          <ul>
+            <li>The <strong>RRT planner runs every 3 s</strong>, builds a frontier path
+                and publishes it to RViz (<code>/exploration_path</code>, <code>/rrt_goal</code>).</li>
+            <li>The robot's <strong>physical motion is handled entirely by
+                <code>SafeLidarMotion</code></strong> — a reactive controller that reads
+                LiDAR sectors and drives forward while steering away from obstacles.</li>
+            <li>The path-follower and control timer inside <code>rrt_exploration.py</code>
+                are <strong>commented out</strong>; RRT produces plans for visualisation
+                only and never sends a <code>/cmd_vel</code> command.</li>
+            <li>The robot roams freely and safely around the room while the audience
+                can see, in RViz, the tree expanding toward unmapped areas in real time.</li>
+          </ul>
+        </div>
+      </div>
+
+      <!-- main2.py -->
+      <div class="demo-box">
+        <div class="demo-box-header alt">Demo 2 &nbsp;—&nbsp; <code>main2.py</code></div>
+        <div class="demo-box-body">
+          <p style="margin-bottom:10px;">
+            <span class="hl">RRT planning + waypoint follower ("my rrt", commit 9686606)</span>
+          </p>
+          <ul>
+            <li>Uses <code>rrt_explorer2.py</code> — an earlier, simpler version of the
+                explorer that also <strong>drives the robot</strong> via a two-phase
+                waypoint follower: <em>TURN in place</em> until aligned, then
+                <em>DRIVE straight</em> to the next waypoint.</li>
+            <li>No <code>SafeLidarMotion</code> is running — the RRT explorer is
+                the sole source of <code>/cmd_vel</code> commands.</li>
+            <li>This is the <span class="hl-warn">more ambitious but less stable</span>
+                version: SLAM drift, timing mismatches between the planner and the
+                controller, and the lack of local obstacle avoidance mean the robot
+                can veer off-path and sometimes collide with walls.</li>
+            <li>Shown as a <em>work-in-progress</em> to demonstrate the intended
+                end-to-end pipeline.</li>
+          </ul>
+        </div>
+      </div>
+
+    </div>
+
+  </div>
+</div>
+
+
+<!-- ══════════════════════════════════════════════════════ -->
+<!-- SLIDE 4 — The core problem with path following        -->
+<!-- ══════════════════════════════════════════════════════ -->
+<div class="slide">
+  <div class="slide-header">Why Path Following Is Difficult on Real Hardware</div>
+  <div class="slide-body">
+
+    <h2>The gap between simulation and reality</h2>
+
+    <p>
+      On paper, a two-phase follower — turn to face the waypoint, then drive
+      straight — should work well. In practice, several things go wrong
+      simultaneously on the physical robot:
+    </p>
+
+    <ul class="body-list">
+      <li>
+        <strong>SLAM pose latency.</strong>
+        The EKF SLAM update runs after each LiDAR scan, but there is a small lag
+        between the robot's true position and the published <code>/slam_pose</code>.
+        When the follower reads the pose to compute the heading error, the robot
+        has already moved slightly — causing the controller to overshoot turns.
+      </li>
+      <li>
+        <strong>Odometry drift.</strong>
+        The omnidirectional wheels produce wheel-slip, especially during in-place
+        rotation. This means the raw odometry (which feeds the EKF prediction step)
+        gradually disagrees with the LiDAR-corrected pose, and the follower may
+        think the robot is aligned when it is not.
+      </li>
+      <li>
+        <strong>No local obstacle avoidance in the follower.</strong>
+        RRT plans a collision-free path at planning time, but the map is
+        continuously updated. By the time the robot reaches a waypoint, a wall
+        that was previously mapped at low confidence may now be solidly marked
+        as occupied — but the follower keeps trying to reach the waypoint and
+        drives straight into it.
+      </li>
+      <li>
+        <strong>Path re-planning lag.</strong>
+        The planner runs every 3 seconds. If an obstacle appears between two
+        planner ticks, the robot has no way to know about it until the next plan
+        is ready, and there is nothing to prevent a collision in the meantime.
+      </li>
+    </ul>
+
+    <hr/>
+
+    <h2>Why Demo 1 is safer</h2>
+    <p>
+      <code>SafeLidarMotion</code> runs at 10 Hz and reacts to the current LiDAR
+      reading <em>directly</em>, with no dependence on SLAM pose accuracy or map
+      quality. It does not know where it is going — but it never hits a wall.
+      Combining this reactive layer with the RRT planner gives us a robot that
+      moves safely through the environment while the planning layer demonstrates
+      correct frontier detection and path construction in RViz.
+      This separation is a valid and commonly used architecture in mobile robotics —
+      it corresponds to the distinction between the <em>global planner</em>
+      (RRT, runs slowly on the map) and the <em>local planner</em> (reactive,
+      runs fast on raw sensor data).
+    </p>
+
+  </div>
+</div>
+
+
+<!-- ══════════════════════════════════════════════════════ -->
+<!-- SLIDE 5 — System architecture summary                 -->
+<!-- ══════════════════════════════════════════════════════ -->
+<div class="slide">
+  <div class="slide-header">System Architecture — Demo 1 (<code>main.py</code>)</div>
+  <div class="slide-body">
+
+    <h2>Node graph</h2>
+
+    <div class="flow" style="flex-direction:column; align-items:flex-start; gap:14px;">
+
+      <div style="display:flex; align-items:center; gap:10px;">
+        <div class="flow-box blue" style="min-width:140px;">LidarSensor<br/><small>/scan</small></div>
+        <span class="arrow">&#8594;</span>
+        <div class="flow-box blue" style="min-width:140px;">ScanPreprocessor<br/><small>(shared object)</small></div>
+        <span class="arrow">&#8594;</span>
+        <div class="flow-box green" style="min-width:160px;">SafeLidarMotion<br/><small>publishes /cmd_vel</small></div>
+      </div>
+
+      <div style="display:flex; align-items:center; gap:10px;">
+        <div class="flow-box blue" style="min-width:140px;">LidarSensor<br/><small>/scan</small></div>
+        <span class="arrow" style="margin-right:0;">&#8594;</span>
+        <div class="flow-box blue" style="min-width:140px;">EKFLidarSLAM<br/><small>/slam_pose, /slam_map</small></div>
+        <span class="arrow">&#8594;</span>
+        <div class="flow-box orange" style="min-width:160px;">RRTExplorer (planner only)<br/><small>/exploration_path, /rrt_goal</small></div>
+      </div>
+
+      <div style="display:flex; align-items:center; gap:10px;">
+        <div class="flow-box blue" style="min-width:140px;">CameraSensor<br/><small>/image_raw</small></div>
+        <span class="arrow">&#8594;</span>
+        <div class="flow-box blue" style="min-width:140px;">ArucoDetector<br/><small>(shared object)</small></div>
+        <span class="arrow">&#8594;</span>
+        <div class="flow-box orange" style="min-width:160px;">ArucoMonitor<br/><small>key/door detection</small></div>
+      </div>
+
+    </div>
+
+    <hr/>
+
+    <ul class="body-list">
+      <li>
+        <code>SafeLidarMotion</code> is the <strong>only node writing to <code>/cmd_vel</code></strong>.
+        The <code>RRTExplorer</code>'s control timer is disabled — it cannot accidentally
+        override the reactive controller.
+      </li>
+      <li>
+        <code>RRTExplorer</code> still has full access to the SLAM map and calls
+        <code>plan_if_needed()</code> every 3 seconds, so the visualisation in RViz
+        updates continuously as the robot moves through the room.
+      </li>
+      <li>
+        <code>ArucoMonitor</code> is active throughout — key and door detection
+        continues to run so the semantic layer can still be demonstrated.
+      </li>
+    </ul>
+
+    <div class="note">
+      <strong>What the audience sees in RViz:</strong> the SLAM occupancy grid growing in
+      real time as unexplored walls are scanned &nbsp;&middot;&nbsp;
+      the robot model following the corrected SLAM pose (not raw odometry) &nbsp;&middot;&nbsp;
+      the planned RRT path in orange updating every 3 s toward the nearest frontier &nbsp;&middot;&nbsp;
+      the goal marker (cyan sphere) jumping to the new frontier each time the planner fires.
+    </div>
+
+  </div>
+</div>
+
+</body>
+</html>
